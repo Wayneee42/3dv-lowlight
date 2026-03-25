@@ -55,14 +55,14 @@ Notes:
 
 ## Data
 
-The code expects Blender-style scene folders with:
+The expected Blender-style scene folders would be like:
 
 - `transforms_train.json`
 - `transforms_val.json`
 - `transforms_test.json`
 - RGB images referenced by those JSON files
 
-Additional scene priors are stored under:
+Additional scene priors would be stored like:
 
 - `auxiliaries/depth/`
 - `auxiliaries/structure/`
