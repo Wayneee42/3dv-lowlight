@@ -160,4 +160,4 @@ stage4_tuned_colmap
   -> stage6_adaptive_chroma_ycbcr_additive
 ```
 
-This is the strongest retained version in this cleaned repository. Historical branches such as canonical calibration, color-checker refinement, occupancy initialization, and merged stage-4/5 training were intentionally removed from the active code path.
+This is a retained and better pipeline version. Historical branches such as canonical calibration, color-checker refinement, occupancy initialization, and merged stage-4/5 training were all proved uncompetitive so that has been removed from the whole pipeline.
