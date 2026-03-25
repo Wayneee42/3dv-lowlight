@@ -1,0 +1,24 @@
+﻿Current trimmed repo focuses on the best pipeline only:
+1. stage4_tuned_colmap
+2. stage5b_ft
+3. stage6_adaptive_chroma_ycbcr_additive
+Key ideas:
+- Fixed-pose COLMAP sparse initialization instead of stronger monocular-depth initialization.
+- Cross-checkpoint staged training instead of merging stage4/stage5 into one optimization trajectory.
+- Sparse-guided weak regularization in stage5b_ft, with multiview disabled.
+- Stage6 uses adaptive proxy calibration, confidence-aware reconstruction weighting, scalar illumination, and additive YCbCr chroma residual.
+Kept directories:
+- core
+- config/stage4_tuned_colmap
+- config/stage5b_ft
+- config/stage6_adaptive_chroma_ycbcr_additive
+- tools/build_fixed_pose_colmap_sparse_init.py
+- tools/extract_marigold_depth.py
+- tools/extract_structure_prior.py
+- dataset
+- marigold
+- colmap
+Removed on purpose:
+- historical stage0-6 configs unrelated to the best pipeline
+- checker/refine/canonical/occupancy experiments
+- outputs/docs/tmp files

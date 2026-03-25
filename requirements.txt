@@ -1,0 +1,14 @@
+numpy
+torch
+torchvision
+gsplat
+omegaconf
+PyYAML
+tqdm
+Pillow
+ninja
+jaxtyping
+rich
+packaging
+setuptools
+wheel
