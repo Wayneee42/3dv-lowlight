@@ -1,6 +1,6 @@
 # 3DRR Low-Light
 
-This repository contains the cleaned code for the final low-light 3DGS pipeline:
+This repository contains code for a low-light 3DGS pipeline:
 
 1. `stage4_tuned_colmap`
 2. `stage5b_ft`
@@ -70,13 +70,13 @@ Additional scene priors would be stored like:
 
 ## Preprocessing
 
-### 1. Marigold depth
+### 1. Marigold depth prior extraction
 
 ```bash
 python tools/extract_marigold_depth.py dataset/.../YourScene
 ```
 
-### 2. Structure prior
+### 2. Structure prior extraction
 
 ```bash
 python tools/extract_structure_prior.py dataset/.../YourScene
