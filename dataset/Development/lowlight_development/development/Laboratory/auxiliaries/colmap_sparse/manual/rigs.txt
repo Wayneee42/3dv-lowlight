@@ -1,4 +1,0 @@
-# Rig list with one line of data per rig:
-#   RIG_ID, NUM_SENSORS, REF_SENSOR_TYPE, REF_SENSOR_ID, SENSORS[]
-# Number of rigs: 1
-1 1 CAMERA 1
