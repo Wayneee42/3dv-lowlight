@@ -10,7 +10,7 @@ The retained method focuses on:
 
 - fixed-pose COLMAP sparse initialization
 - staged geometry-to-appearance training
-- weak sparse-guided geometry regularization in stage 5
+- weak sparse-guided geometry regularization in stage 5 using a robust Charbonnier-style loss with a small $k$-NN sparse neighborhood
 - scalar illumination with additive YCbCr chroma residual in stage 6
 
 ## Repository Layout
@@ -118,7 +118,7 @@ This stage warm-starts from `stage4_tuned_colmap` and uses:
 - no densification
 - structure prior from step 0
 - weak depth prior
-- weak sparse-guided geometry regularization
+- weak sparse-guided geometry regularization using robust $k$-NN sparse support
 
 ### Stage 3: appearance refinement
 
@@ -133,6 +133,8 @@ This stage warm-starts from `stage5b_ft` and uses:
 - scalar illumination head
 - additive YCbCr chroma residual
 
+Training only writes checkpoints and lightweight augmentation/proxy examples. Final rendered outputs are generated separately by `eval.py`.
+
 ## Evaluation
 
 Render a saved checkpoint:
@@ -144,6 +146,7 @@ python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/YourScene/step_5
 Outputs are written to:
 
 - `outputs/<stage>/<scene>/step_<N>/test/`
+- `train.py` does not export validation/test renders; all render export is handled by `eval.py`
 
 When ground-truth test images exist, `eval.py` also writes:
 

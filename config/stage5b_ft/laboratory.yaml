@@ -93,7 +93,8 @@ PRIORS:
     START_STEP: 0
     SAMPLE_POINTS: 1024
     MIN_OPACITY: 0.2
-    DISTANCE_CLAMP: 0.05
+    ROBUST_SCALE: 0.05
+    KNN_K: 3
     COLMAP_DIR: 'auxiliaries/colmap_sparse'
 
 EXPERIMENT:

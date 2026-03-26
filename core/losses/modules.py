@@ -228,12 +228,16 @@ class SparsePointRegularizationLoss(BaseLossModule):
         start_step=0,
         sample_points=1024,
         min_opacity=0.2,
-        distance_clamp=0.05,
+        robust_scale=0.05,
+        knn_k=3,
+        knn_eps=1.0e-6,
     ):
         super().__init__(name="sparse_guided", weight=weight, enabled=weight > 0.0, start_step=start_step)
         self.sample_points = int(max(1, sample_points))
         self.min_opacity = float(min_opacity)
-        self.distance_clamp = float(max(0.0, distance_clamp))
+        self.robust_scale = float(max(0.0, robust_scale))
+        self.knn_k = int(max(1, knn_k))
+        self.knn_eps = float(max(1.0e-12, knn_eps))
 
     def compute(self, context):
         if not self.is_active(context):
@@ -256,6 +260,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
             zero = zero_scalar_like(context)
             return zero, {"active": 1.0, "sampled": 0.0, "distance_mean": 0.0}
 
+        active_means = means[active_indices]
         sample_count = min(int(active_indices.numel()), self.sample_points)
         if active_indices.numel() > sample_count:
             perm = torch.randperm(active_indices.numel(), device=active_indices.device)[:sample_count]
@@ -263,15 +268,28 @@ class SparsePointRegularizationLoss(BaseLossModule):
         sampled_means = means[active_indices]
 
         distances = torch.cdist(sampled_means, sparse_points)
-        nearest_dist = distances.min(dim=1).values
-        if self.distance_clamp > 0.0:
-            nearest_dist = nearest_dist.clamp_max(self.distance_clamp)
-        loss = nearest_dist.mean()
+        knn_k = min(self.knn_k, int(sparse_points.shape[0]))
+        knn_dist, knn_idx = torch.topk(distances, k=knn_k, dim=1, largest=False)
+        knn_points = sparse_points[knn_idx]
+        knn_weights = 1.0 / knn_dist.clamp_min(self.knn_eps)
+        knn_weights = knn_weights / knn_weights.sum(dim=1, keepdim=True).clamp_min(self.knn_eps)
+        target_points = (knn_points * knn_weights.unsqueeze(-1)).sum(dim=1)
+        target_dist = torch.norm(sampled_means - target_points, dim=1)
+        if self.robust_scale > 0.0:
+            robust_loss = torch.sqrt(target_dist.square() + self.robust_scale * self.robust_scale) - self.robust_scale
+        else:
+            robust_loss = target_dist
+        loss = robust_loss.mean()
+        sampled_opacity = opacity_values[active_indices]
         return loss, {
             "active": 1.0,
             "sampled": float(sample_count),
-            "distance_mean": float(nearest_dist.detach().mean().item()),
-            "opacity_mean": float(opacity_values[active_indices].detach().mean().item()),
+            "distance_mean": float(target_dist.detach().mean().item()),
+            "knn_dist_mean": float(knn_dist.detach().mean().item()),
+            "knn_k": float(knn_k),
+            "robust_mean": float(robust_loss.detach().mean().item()),
+            "robust_scale": float(self.robust_scale),
+            "opacity_mean": float(sampled_opacity.detach().mean().item()),
         }
 
 

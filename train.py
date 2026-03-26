@@ -194,56 +194,6 @@ def load_warmstart_checkpoint(model, checkpoint_path, device):
         f"illum_converted={int(converted_illum)}, sh_degree={model.sh_degree}"
     )
 
-def _build_chroma_preview_maps(render_outputs):
-    chroma_delta = render_outputs.get("chroma_delta")
-    chroma_factor = render_outputs.get("chroma_factor")
-    chroma_scale = float(render_outputs.get("chroma_scale", 0.10))
-    if chroma_delta is not None:
-        denom = max(2.0 * chroma_scale, 1.0e-6)
-        cb = (0.5 + chroma_delta[..., 0] / denom).clamp(0.0, 1.0).unsqueeze(0).repeat(3, 1, 1)
-        cr = (0.5 + chroma_delta[..., 1] / denom).clamp(0.0, 1.0).unsqueeze(0).repeat(3, 1, 1)
-        return cb, cr
-    if chroma_factor is None:
-        return None, None
-    min_factor = 1.0 - chroma_scale
-    denom = max(2.0 * chroma_scale, 1.0e-6)
-    cb = ((chroma_factor[..., 0] - min_factor) / denom).clamp(0.0, 1.0).unsqueeze(0).repeat(3, 1, 1)
-    cr = ((chroma_factor[..., 1] - min_factor) / denom).clamp(0.0, 1.0).unsqueeze(0).repeat(3, 1, 1)
-    return cb, cr
-
-
-def save_render_outputs(render_outputs, frame_key, root_dir):
-    final_image = render_outputs["recon_rgb"]
-    save_image(final_image.permute(2, 0, 1).clamp(0, 1), os.path.join(root_dir, f"{frame_key}.png"))
-
-    illum_aux = render_outputs.get("illum_aux")
-    if illum_aux is None:
-        return final_image
-
-    base_dir = os.path.join(root_dir, "base")
-    illum_dir = os.path.join(root_dir, "illum")
-    recon_dir = os.path.join(root_dir, "recon")
-    chroma_dir = os.path.join(root_dir, "chroma")
-    os.makedirs(base_dir, exist_ok=True)
-    os.makedirs(illum_dir, exist_ok=True)
-    os.makedirs(recon_dir, exist_ok=True)
-    os.makedirs(chroma_dir, exist_ok=True)
-
-    base_image = render_outputs.get("base_lit_rgb")
-    if base_image is None:
-        base_image = render_outputs["rgb"]
-    illum_image = torch.clamp(2.0 * torch.sigmoid(illum_aux), 0.0, 2.0) / 2.0
-    save_image(base_image.permute(2, 0, 1).clamp(0, 1), os.path.join(base_dir, f"{frame_key}.png"))
-    save_image(illum_image.permute(2, 0, 1).clamp(0, 1), os.path.join(illum_dir, f"{frame_key}.png"))
-    save_image(final_image.permute(2, 0, 1).clamp(0, 1), os.path.join(recon_dir, f"{frame_key}.png"))
-    cb_preview, cr_preview = _build_chroma_preview_maps(render_outputs)
-    if cb_preview is not None and cr_preview is not None:
-        save_image(cb_preview, os.path.join(chroma_dir, f"cb_factor_{frame_key}.png"))
-        save_image(cr_preview, os.path.join(chroma_dir, f"cr_factor_{frame_key}.png"))
-    return final_image
-
-
-
 def train(config_path, device="cuda"):
     meta_cfg = ConfigDict(config_path=config_path)
     seed = int(_cfg_get(meta_cfg, "SEED", 3407))
@@ -265,7 +215,6 @@ def train(config_path, device="cuda"):
     multiview_cfg = _cfg_get(_cfg_get(meta_cfg, "PRIORS", None), "MULTIVIEW", None)
     sparse_cfg = _cfg_get(_cfg_get(meta_cfg, "PRIORS", None), "SPARSE", None)
     train_dataset = Blender(meta_cfg.DATASET, split="train")
-    val_dataset = Blender(meta_cfg.DATASET, split="val", load_images=False)
     num_train = len(train_dataset._records_keys)
 
     init_records = []
@@ -376,7 +325,7 @@ def train(config_path, device="cuda"):
         context = {
             "step": current_step,
             "rendered": rendered,
-            "rgb_base_hwc": scene_calibrated_hwc if scene_calibrated_hwc is not None else render_outputs["rgb"],
+            "rgb_base_hwc": render_outputs["rgb"],
             "rgb_model_hwc": render_outputs["rgb"],
             "recon_hwc": render_outputs["recon_rgb"],
             "gaussian_means": model.splats["means"],
@@ -496,81 +445,8 @@ def train(config_path, device="cuda"):
                 train_proxy_shadow_images = None
                 train_proxy_weight_images = None
 
-        if current_step % cfg.VAL_INTERVAL_STEP == 0:
-            validate(model, val_dataset, current_step, device, output_dir, aux_heads)
-
         if current_step in checkpoint_steps:
             save_checkpoint(model, output_dir, current_step, meta_cfg)
-
-    test_dataset = Blender(meta_cfg.DATASET, split="test", load_images=False)
-    evaluate(model, test_dataset, device, output_dir, total_steps, aux_heads)
-
-
-@torch.no_grad()
-def validate(model, val_dataset, step, device, output_dir, render_heads):
-    model.eval()
-    step_dir = build_step_dir(output_dir, step)
-    examples_dir = os.path.join(step_dir, "examples")
-    os.makedirs(examples_dir, exist_ok=True)
-
-    H, W = val_dataset._data_info["img_h"], val_dataset._data_info["img_w"]
-    num_val = len(val_dataset._records_keys)
-    recon_images = []
-    base_images = []
-    illum_images = []
-    chroma_cb_images = []
-    chroma_cr_images = []
-    for index in range(num_val):
-        data = val_dataset[index]
-        camtoworld = data["transforms"].to(device)
-        render_outputs = model(camtoworld, H, W, render_heads=render_heads)
-        output_image = render_outputs["recon_rgb"]
-        recon_images.append(output_image.permute(2, 0, 1).clamp(0, 1))
-        if render_outputs["illum_aux"] is not None:
-            base_image = render_outputs.get("base_lit_rgb")
-            if base_image is None:
-                base_image = render_outputs["rgb"]
-            base_images.append(base_image.permute(2, 0, 1).clamp(0, 1))
-            illum_images.append((torch.clamp(2.0 * torch.sigmoid(render_outputs["illum_aux"]), 0.0, 2.0) / 2.0).permute(2, 0, 1))
-            cb_preview, cr_preview = _build_chroma_preview_maps(render_outputs)
-            if cb_preview is not None and cr_preview is not None:
-                chroma_cb_images.append(cb_preview)
-                chroma_cr_images.append(cr_preview)
-        if len(recon_images) >= 4:
-            break
-    if recon_images:
-        recon_grid = make_grid(recon_images, nrow=2)
-        save_image(recon_grid, os.path.join(examples_dir, f"val_step{step}.jpg"))
-        save_image(recon_grid, os.path.join(examples_dir, f"val_recon_step{step}.jpg"))
-    if base_images:
-        save_image(make_grid(base_images, nrow=2), os.path.join(examples_dir, f"val_base_step{step}.jpg"))
-    if illum_images:
-        save_image(make_grid(illum_images, nrow=2), os.path.join(examples_dir, f"val_illum_step{step}.jpg"))
-    if chroma_cb_images:
-        save_image(make_grid(chroma_cb_images, nrow=2), os.path.join(examples_dir, f"val_chroma_cb_step{step}.jpg"))
-    if chroma_cr_images:
-        save_image(make_grid(chroma_cr_images, nrow=2), os.path.join(examples_dir, f"val_chroma_cr_step{step}.jpg"))
-    print(f"\n[Step {step}] {model.num_gaussians} Gaussians")
-    model.train()
-
-
-@torch.no_grad()
-def evaluate(model, test_dataset, device, output_dir, step, render_heads):
-    model.eval()
-    step_dir = build_step_dir(output_dir, step)
-    test_dir = os.path.join(step_dir, "test")
-    os.makedirs(test_dir, exist_ok=True)
-
-    H, W = test_dataset._data_info["img_h"], test_dataset._data_info["img_w"]
-    num_test = len(test_dataset._records_keys)
-    for index in range(num_test):
-        data = test_dataset[index]
-        camtoworld = data["transforms"].to(device)
-        render_outputs = model(camtoworld, H, W, render_heads=render_heads)
-        frame_key = data["infos"]["frame_key"]
-        save_render_outputs(render_outputs, frame_key, test_dir)
-    print(f"Test renders saved to {test_dir}/")
-    model.train()
 
 
 if __name__ == "__main__":

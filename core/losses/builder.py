@@ -112,7 +112,9 @@ def build_loss_modules(meta_cfg, model_cfg):
                 start_step=int(_cfg_get(sparse_cfg, "START_STEP", 0)),
                 sample_points=int(_cfg_get(sparse_cfg, "SAMPLE_POINTS", 1024)),
                 min_opacity=float(_cfg_get(sparse_cfg, "MIN_OPACITY", 0.2)),
-                distance_clamp=float(_cfg_get(sparse_cfg, "DISTANCE_CLAMP", 0.05)),
+                robust_scale=float(_cfg_get(sparse_cfg, "ROBUST_SCALE", _cfg_get(sparse_cfg, "DISTANCE_CLAMP", 0.05))),
+                knn_k=int(_cfg_get(sparse_cfg, "KNN_K", 3)),
+                knn_eps=float(_cfg_get(sparse_cfg, "KNN_EPS", 1.0e-6)),
             )
         )
 
