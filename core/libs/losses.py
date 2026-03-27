@@ -22,6 +22,14 @@ def ycbcr_to_rgb_hwc(ycbcr_hwc):
     return torch.stack([r, g, b], dim=-1)
 
 
+def apply_ycbcr_luminance_gain(rgb_hwc, illum_factor):
+    ycbcr = rgb_to_ycbcr_hwc(rgb_hwc)
+    y = torch.clamp(ycbcr[..., 0] * illum_factor.squeeze(-1), 0.0, 1.0)
+    adjusted_ycbcr = torch.stack([y, ycbcr[..., 1], ycbcr[..., 2]], dim=-1)
+    base_lit_rgb = torch.clamp(ycbcr_to_rgb_hwc(adjusted_ycbcr), 0.0, 1.0)
+    return base_lit_rgb, adjusted_ycbcr
+
+
 def chroma_factor_from_aux(chroma_aux, scale):
     return 1.0 + float(scale) * torch.tanh(chroma_aux)
 

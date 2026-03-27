@@ -10,8 +10,8 @@ The retained method focuses on:
 
 - fixed-pose COLMAP sparse initialization
 - staged geometry-to-appearance training
-- weak sparse-guided geometry regularization in stage 5 using a robust Charbonnier-style loss with a small $k$-NN sparse neighborhood
-- scalar illumination with additive YCbCr chroma residual in stage 6
+- weak sparse-guided geometry regularization in stage 5 using a robust Charbonnier-style loss, a small $k$-NN sparse neighborhood, and sparse quality/density-aware support weighting
+- decoupled stage-6 appearance modeling with Y-only illumination and additive YCbCr chroma residual
 
 ## Repository Layout
 
@@ -98,6 +98,7 @@ This stage:
 - writes official poses into a manual COLMAP model
 - runs feature extraction, matching, and triangulation
 - saves sparse points to `auxiliaries/colmap_sparse/points.npy`
+- saves sparse metadata to `auxiliaries/colmap_sparse/points_meta.npz`
 
 ## Training
 
@@ -119,6 +120,7 @@ This stage warm-starts from `stage4_tuned_colmap` and uses:
 - structure prior from step 0
 - weak depth prior
 - weak sparse-guided geometry regularization using robust $k$-NN sparse support
+- sparse quality/density-aware weighting derived from COLMAP track length, reprojection error, and local sparse density
 
 ### Stage 3: appearance refinement
 
@@ -130,8 +132,9 @@ This stage warm-starts from `stage5b_ft` and uses:
 
 - adaptive proxy brightness calibration
 - confidence-aware reconstruction weighting
-- scalar illumination head
+- illumination applied directly to luminance `Y` in YCbCr space
 - additive YCbCr chroma residual
+- split supervision: `Y` is guided by the proxy relighting target, while `Cb/Cr` are supervised separately through the chroma branch
 
 Training only writes checkpoints and lightweight augmentation/proxy examples. Final rendered outputs are generated separately by `eval.py`.
 

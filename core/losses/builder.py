@@ -1,13 +1,14 @@
 import torch
 
 from .modules import (
+    ChromaReconstructionLoss,
     ChromaResidualRegularizationLoss,
     DepthPriorLoss,
     ExposureControlLoss,
     IlluminationRegularizationLoss,
+    LuminanceReconstructionLoss,
     LowLightConsistencyLoss,
     MultiViewReprojectionLoss,
-    ReconstructionLoss,
     RGBReconstructionLoss,
     SparsePointRegularizationLoss,
     StructurePriorLoss,
@@ -34,8 +35,9 @@ def build_loss_modules(meta_cfg, model_cfg):
     sparse_cfg = _cfg_get(priors_cfg, "SPARSE", None)
 
     lambda_ssim = float(_cfg_get(loss_cfg, "LAMBDA_SSIM", model_cfg.LAMBDA_SSIM))
-    lambda_reconstruction = float(_cfg_get(loss_cfg, "LAMBDA_RECONSTRUCTION", 0.0))
-    has_reconstruction = lambda_reconstruction > 0.0
+    lambda_recon_y = float(_cfg_get(loss_cfg, "LAMBDA_RECON_Y", 0.0))
+    lambda_recon_cbcr = float(_cfg_get(loss_cfg, "LAMBDA_RECON_CBCR", 0.0))
+    has_reconstruction = lambda_recon_y > 0.0 or lambda_recon_cbcr > 0.0
 
     modules = [
         RGBReconstructionLoss(
@@ -44,26 +46,49 @@ def build_loss_modules(meta_cfg, model_cfg):
             input_key="rgb_base_hwc" if has_reconstruction else "rendered",
             target_key="supervision_hwc",
         ),
-        ReconstructionLoss(
-            lambda_ssim=lambda_ssim,
-            weight=lambda_reconstruction,
-            start_step=int(_cfg_get(loss_cfg, "RECON_START_STEP", 0)),
-            input_key="recon_hwc",
-            target_key="proxy_target_hwc",
-            use_weight_map=bool(_cfg_get(loss_cfg, "RECON_WEIGHT_MAP_ENABLED", False)),
-            dark_boost=float(_cfg_get(loss_cfg, "RECON_DARK_BOOST", 0.0)),
-            bright_threshold=float(_cfg_get(loss_cfg, "RECON_BRIGHT_THRESHOLD", 0.70)),
-            bright_suppression=float(_cfg_get(loss_cfg, "RECON_BRIGHT_SUPPRESSION", 0.0)),
-            confidence_floor=float(_cfg_get(loss_cfg, "RECON_CONFIDENCE_FLOOR", 1.0)),
-            structure_power=float(_cfg_get(loss_cfg, "RECON_STRUCTURE_POWER", 1.0)),
-            weight_min=float(_cfg_get(loss_cfg, "RECON_WEIGHT_MIN", 0.25)),
-            weight_max=float(_cfg_get(loss_cfg, "RECON_WEIGHT_MAX", 2.0)),
-        ),
         IlluminationRegularizationLoss(weight=float(_cfg_get(loss_cfg, "LAMBDA_ILLUM_REG", 0.0))),
         ChromaResidualRegularizationLoss(weight=float(_cfg_get(loss_cfg, "LAMBDA_CHROMA_REG", 0.0))),
         LowLightConsistencyLoss(weight=float(_cfg_get(loss_cfg, "LAMBDA_LOW_LIGHT", 0.0))),
         ExposureControlLoss(weight=float(_cfg_get(loss_cfg, "LAMBDA_EXPOSURE", 0.0))),
     ]
+
+    modules.extend(
+        [
+            LuminanceReconstructionLoss(
+                weight=lambda_recon_y,
+                start_step=int(_cfg_get(loss_cfg, "RECON_START_STEP", 0)),
+                input_key="recon_hwc",
+                target_key="proxy_target_hwc",
+                use_weight_map=bool(_cfg_get(loss_cfg, "RECON_WEIGHT_MAP_ENABLED", False)),
+                dark_boost=float(_cfg_get(loss_cfg, "RECON_DARK_BOOST", 0.0)),
+                bright_threshold=float(_cfg_get(loss_cfg, "RECON_BRIGHT_THRESHOLD", 0.70)),
+                bright_suppression=float(_cfg_get(loss_cfg, "RECON_BRIGHT_SUPPRESSION", 0.0)),
+                confidence_floor=float(_cfg_get(loss_cfg, "RECON_CONFIDENCE_FLOOR", 1.0)),
+                structure_power=float(_cfg_get(loss_cfg, "RECON_STRUCTURE_POWER", 1.0)),
+                weight_min=float(_cfg_get(loss_cfg, "RECON_WEIGHT_MIN", 0.25)),
+                weight_max=float(_cfg_get(loss_cfg, "RECON_WEIGHT_MAX", 2.0)),
+            ),
+            ChromaReconstructionLoss(
+                weight=lambda_recon_cbcr,
+                start_step=int(_cfg_get(loss_cfg, "RECON_START_STEP", 0)),
+                input_key="recon_hwc",
+                target_key="proxy_target_hwc",
+                reference_key=str(_cfg_get(loss_cfg, "CBCR_REFERENCE_KEY", "supervision_hwc")),
+                use_weight_map=bool(_cfg_get(loss_cfg, "RECON_WEIGHT_MAP_ENABLED", False)),
+                bright_threshold=float(_cfg_get(loss_cfg, "RECON_BRIGHT_THRESHOLD", 0.70)),
+                bright_suppression=float(_cfg_get(loss_cfg, "RECON_BRIGHT_SUPPRESSION", 0.0)),
+                confidence_floor=float(_cfg_get(loss_cfg, "CBCR_CONFIDENCE_FLOOR", 0.45)),
+                structure_power=float(_cfg_get(loss_cfg, "RECON_STRUCTURE_POWER", 1.0)),
+                weight_min=float(_cfg_get(loss_cfg, "CBCR_WEIGHT_MIN", 0.20)),
+                weight_max=float(_cfg_get(loss_cfg, "CBCR_WEIGHT_MAX", 1.50)),
+                shadow_power=float(_cfg_get(loss_cfg, "CBCR_SHADOW_POWER", 0.5)),
+                global_mean_weight=float(_cfg_get(loss_cfg, "CBCR_GLOBAL_MEAN_WEIGHT", 0.0)),
+                proxy_blend=float(_cfg_get(loss_cfg, "CBCR_PROXY_BLEND", 1.0)),
+                cb_weight=float(_cfg_get(loss_cfg, "CB_WEIGHT", 1.0)),
+                cr_weight=float(_cfg_get(loss_cfg, "CR_WEIGHT", 1.0)),
+            ),
+        ]
+    )
 
     if bool(_cfg_get(depth_cfg, "ENABLED", False)):
         modules.append(
@@ -115,6 +140,12 @@ def build_loss_modules(meta_cfg, model_cfg):
                 robust_scale=float(_cfg_get(sparse_cfg, "ROBUST_SCALE", _cfg_get(sparse_cfg, "DISTANCE_CLAMP", 0.05))),
                 knn_k=int(_cfg_get(sparse_cfg, "KNN_K", 3)),
                 knn_eps=float(_cfg_get(sparse_cfg, "KNN_EPS", 1.0e-6)),
+                meta_enabled=bool(_cfg_get(sparse_cfg, "META_ENABLED", True)),
+                density_k=int(_cfg_get(sparse_cfg, "DENSITY_K", 8)),
+                density_clamp_min=float(_cfg_get(sparse_cfg, "DENSITY_CLAMP_MIN", 0.5)),
+                density_clamp_max=float(_cfg_get(sparse_cfg, "DENSITY_CLAMP_MAX", 2.0)),
+                quality_error_scale_mode=str(_cfg_get(sparse_cfg, "QUALITY_ERROR_SCALE_MODE", "median")),
+                quality_track_mode=str(_cfg_get(sparse_cfg, "QUALITY_TRACK_MODE", "log_median_norm")),
             )
         )
 
@@ -147,9 +178,9 @@ def required_aux_heads(loss_modules, model_cfg=None):
         heads.append("depth")
     if any(module.name == "structure_prior" for module in loss_modules):
         heads.append("prior")
-    if any(module.name in {"reconstruction", "illum_reg"} for module in loss_modules):
+    if any(module.name in {"reconstruction", "luminance_reconstruction", "chroma_reconstruction", "illum_reg"} for module in loss_modules):
         heads.append("illum")
-    if bool(_cfg_get(model_cfg, "CHROMA_RESIDUAL_ENABLED", False)) or any(module.name == "chroma_reg" for module in loss_modules):
+    if bool(_cfg_get(model_cfg, "CHROMA_RESIDUAL_ENABLED", False)) or any(module.name in {"chroma_reg", "chroma_reconstruction"} for module in loss_modules):
         heads.append("chroma")
     return tuple(heads)
 

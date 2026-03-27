@@ -96,7 +96,16 @@ PRIORS:
     ROBUST_SCALE: 0.05
     KNN_K: 3
     COLMAP_DIR: 'auxiliaries/colmap_sparse'
-
+    META_ENABLED: true
+    DENSITY_K: 8
+    DENSITY_CLAMP_MIN: 0.5
+    DENSITY_CLAMP_MAX: 2.0
+    QUALITY_ERROR_SCALE_MODE: 'median'
+    QUALITY_TRACK_MODE: 'log_median_norm'
 EXPERIMENT:
   STAGE: 'stage5b_ft'
+
+
+
+
 

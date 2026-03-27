@@ -94,9 +94,11 @@ def build_eval_heads(meta_cfg):
         heads.append("depth")
     if bool(_cfg_get(structure_cfg, "ENABLED", False)):
         heads.append("prior")
-    if float(_cfg_get(loss_cfg, "LAMBDA_RECONSTRUCTION", 0.0)) > 0.0:
+    lambda_recon_y = float(_cfg_get(loss_cfg, "LAMBDA_RECON_Y", 0.0))
+    lambda_recon_cbcr = float(_cfg_get(loss_cfg, "LAMBDA_RECON_CBCR", 0.0))
+    if lambda_recon_y > 0.0 or lambda_recon_cbcr > 0.0 or float(_cfg_get(loss_cfg, "LAMBDA_ILLUM_REG", 0.0)) > 0.0:
         heads.append("illum")
-    if bool(_cfg_get(model_cfg, "CHROMA_RESIDUAL_ENABLED", False)):
+    if bool(_cfg_get(model_cfg, "CHROMA_RESIDUAL_ENABLED", False)) or lambda_recon_cbcr > 0.0 or float(_cfg_get(loss_cfg, "LAMBDA_CHROMA_REG", 0.0)) > 0.0:
         heads.append("chroma")
     return tuple(heads)
 

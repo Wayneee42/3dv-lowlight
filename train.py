@@ -105,7 +105,7 @@ def resolve_checkpoint_steps(cfg):
 
 def load_colmap_sparse_points(meta_cfg, sparse_cfg, device):
     if not bool(_cfg_get(sparse_cfg, "ENABLED", False)):
-        return None
+        return None, None, None
     scene_root = Path(str(meta_cfg.DATASET.DATA_PATH))
     colmap_dir = str(_cfg_get(sparse_cfg, "COLMAP_DIR", "auxiliaries/colmap_sparse"))
     colmap_root = Path(colmap_dir) if os.path.isabs(colmap_dir) else scene_root / colmap_dir
@@ -116,8 +116,32 @@ def load_colmap_sparse_points(meta_cfg, sparse_cfg, device):
     if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] == 0:
         raise RuntimeError(f"Sparse prior requires non-empty [N,3] points.npy, got {points.shape}: {points_path}")
     points_tensor = torch.from_numpy(points).to(device)
-    print(f"[Sparse] loaded {points_tensor.shape[0]} COLMAP sparse points from {points_path}")
-    return points_tensor
+    track_len = np.ones((points.shape[0],), dtype=np.float32)
+    reproj_error = np.ones((points.shape[0],), dtype=np.float32)
+    meta_enabled = bool(_cfg_get(sparse_cfg, "META_ENABLED", False))
+    meta_path = colmap_root / "points_meta.npz"
+    used_metadata = False
+    if meta_enabled and meta_path.exists():
+        meta = np.load(meta_path)
+        meta_xyz = np.asarray(meta["xyz"], dtype=np.float32)
+        meta_track_len = np.asarray(meta["track_len"], dtype=np.float32).reshape(-1)
+        meta_reproj_error = np.asarray(meta["reproj_error"], dtype=np.float32).reshape(-1)
+        if (
+            meta_xyz.shape == points.shape
+            and meta_track_len.shape[0] == points.shape[0]
+            and meta_reproj_error.shape[0] == points.shape[0]
+            and np.allclose(meta_xyz, points)
+        ):
+            track_len = meta_track_len
+            reproj_error = meta_reproj_error
+            used_metadata = True
+    track_len_tensor = torch.from_numpy(track_len).to(device)
+    reproj_error_tensor = torch.from_numpy(reproj_error).to(device)
+    print(
+        f"[Sparse] loaded {points_tensor.shape[0]} COLMAP sparse points from {points_path}, "
+        f"meta_used={int(used_metadata)}"
+    )
+    return points_tensor, track_len_tensor, reproj_error_tensor
 
 
 def save_checkpoint(model, output_dir, step, meta_cfg):
@@ -231,13 +255,20 @@ def train(config_path, device="cuda"):
         "scene_root": str(meta_cfg.DATASET.DATA_PATH),
         "records": init_records,
     }
-    colmap_sparse_points = load_colmap_sparse_points(meta_cfg, sparse_cfg, device)
+    colmap_sparse_points, colmap_sparse_track_len, colmap_sparse_reproj_error = load_colmap_sparse_points(meta_cfg, sparse_cfg, device)
 
     model = Simple3DGS(cfg, train_dataset._data_info, init_context=init_context).to(device)
     warmstart_checkpoint = _cfg_get(cfg, "WARMSTART_CHECKPOINT", None)
     if warmstart_checkpoint:
         load_warmstart_checkpoint(model, warmstart_checkpoint, device)
     print(f"Initialized {model.num_gaussians} Gaussians")
+    freeze_geometry = bool(_cfg_get(cfg, "FREEZE_GEOMETRY", False))
+    frozen_geometry_keys = {"means", "quats", "scales"} if freeze_geometry else set()
+    if freeze_geometry:
+        for key in frozen_geometry_keys:
+            if key in model.splats:
+                model.splats[key].requires_grad_(False)
+        print("[Freeze] geometry parameters frozen: means,quats,scales")
 
     lr_map = {
         "means": cfg.LR_MEANS,
@@ -253,27 +284,30 @@ def train(config_path, device="cuda"):
     }
     optimizers = {}
     for name, param in model.splats.items():
+        if name in frozen_geometry_keys:
+            continue
         optimizers[name] = torch.optim.Adam([param], lr=lr_map[name], eps=1e-15)
 
     total_steps = int(cfg.TRAIN_TOTAL_STEP)
     lr_final_factor = cfg.LR_MEANS_FINAL / cfg.LR_MEANS
-    schedulers = {
-        "means": torch.optim.lr_scheduler.ExponentialLR(
+    schedulers = {}
+    if "means" in optimizers:
+        schedulers["means"] = torch.optim.lr_scheduler.ExponentialLR(
             optimizers["means"], gamma=lr_final_factor ** (1.0 / total_steps)
         )
-    }
 
     strategy = None
     strategy_state = None
-    strategy = gsplat.DefaultStrategy(
-        verbose=False,
-        refine_start_iter=cfg.DENSIFY_START_STEP,
-        refine_stop_iter=cfg.DENSIFY_STOP_STEP,
-        refine_every=cfg.DENSIFY_INTERVAL,
-        grow_grad2d=cfg.DENSIFY_GRAD_THRESH,
-        reset_every=cfg.OPACITY_RESET_INTERVAL,
-    )
-    strategy_state = strategy.initialize_state(scene_scale=cfg.SCENE_SCALE)
+    if not freeze_geometry:
+        strategy = gsplat.DefaultStrategy(
+            verbose=False,
+            refine_start_iter=cfg.DENSIFY_START_STEP,
+            refine_stop_iter=cfg.DENSIFY_STOP_STEP,
+            refine_every=cfg.DENSIFY_INTERVAL,
+            grow_grad2d=cfg.DENSIFY_GRAD_THRESH,
+            reset_every=cfg.OPACITY_RESET_INTERVAL,
+        )
+        strategy_state = strategy.initialize_state(scene_scale=cfg.SCENE_SCALE)
     intrinsics = torch.tensor(
         [
             [float(train_dataset._data_info["fl_x"]), 0.0, float(train_dataset._data_info["cx"])],
@@ -341,6 +375,8 @@ def train(config_path, device="cuda"):
             "chroma_mode": render_outputs.get("chroma_mode", "multiplicative"),
             "chroma_scale": render_outputs.get("chroma_scale", 0.10),
             "colmap_sparse_points": colmap_sparse_points,
+            "colmap_sparse_track_len": colmap_sparse_track_len,
+            "colmap_sparse_reproj_error": colmap_sparse_reproj_error,
             "supervision_hwc": supervision_image.permute(1, 2, 0),
             "proxy_shadow_weight_hwc": train_batch["proxy_shadow_weight"],
             "reference_hwc": reference_image.permute(1, 2, 0),
@@ -371,9 +407,11 @@ def train(config_path, device="cuda"):
         loss_logs["neighbor_distance"] = float(neighbor_distance)
         loss_logs["chroma_available"] = float(render_outputs.get("chroma_aux") is not None)
 
-        strategy.step_pre_backward(model.splats, optimizers, strategy_state, step, render_outputs["info"])
+        if strategy is not None:
+            strategy.step_pre_backward(model.splats, optimizers, strategy_state, step, render_outputs["info"])
         loss.backward()
-        strategy.step_post_backward(model.splats, optimizers, strategy_state, step, render_outputs["info"], packed=False)
+        if strategy is not None:
+            strategy.step_post_backward(model.splats, optimizers, strategy_state, step, render_outputs["info"], packed=False)
 
         for optimizer in optimizers.values():
             optimizer.step()
@@ -397,7 +435,12 @@ def train(config_path, device="cuda"):
             }
             if has_reconstruction:
                 postfix["rgb_b"] = f"{loss_logs.get('rgb_base', 0.0):.4f}"
-                postfix["rec"] = f"{loss_logs.get('reconstruction', 0.0):.4f}"
+                if "luminance_reconstruction" in loss_logs:
+                    postfix["rec_y"] = f"{loss_logs.get('luminance_reconstruction', 0.0):.4f}"
+                if "chroma_reconstruction" in loss_logs:
+                    postfix["rec_c"] = f"{loss_logs.get('chroma_reconstruction', 0.0):.4f}"
+                if "reconstruction" in loss_logs:
+                    postfix["rec"] = f"{loss_logs.get('reconstruction', 0.0):.4f}"
                 postfix["psnr_b"] = f"{psnr_base:.2f}"
                 postfix["psnr_r"] = f"{psnr_recon:.2f}"
             else:

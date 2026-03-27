@@ -83,10 +83,55 @@ class RGBReconstructionLoss(BaseLossModule):
         }
 
 
-class ReconstructionLoss(BaseLossModule):
+def normalize_weight_map(weight_map, weight_min, weight_max):
+    weight_map = weight_map / weight_map.mean().clamp_min(1.0e-6)
+    return weight_map.clamp(weight_min, weight_max)
+
+
+def build_bright_factor(target, bright_threshold, bright_suppression):
+    if bright_suppression <= 0.0:
+        return torch.ones(target.shape[:2], device=target.device, dtype=target.dtype)
+    target_luma = 0.299 * target[..., 0] + 0.587 * target[..., 1] + 0.114 * target[..., 2]
+    bright_mask = (target_luma > bright_threshold).to(dtype=target.dtype)
+    return 1.0 - bright_suppression * bright_mask
+
+
+def build_alpha_confidence(context, target, confidence_floor):
+    alphas = context.get("alphas")
+    if alphas is None:
+        return torch.ones(target.shape[:2], device=target.device, dtype=target.dtype)
+    alpha_map = squeeze_single_channel(alphas.to(device=target.device, dtype=target.dtype), "alphas").clamp(0.0, 1.0)
+    return confidence_floor + (1.0 - confidence_floor) * alpha_map
+
+
+def build_structure_confidence(context, target, confidence_floor, structure_power):
+    structure = context.get("structure")
+    if structure is None:
+        return torch.ones(target.shape[:2], device=target.device, dtype=target.dtype)
+    structure = squeeze_single_channel(structure.to(device=target.device, dtype=target.dtype), "structure")
+    structure = minmax_normalize_map(structure).clamp(0.0, 1.0)
+    structure_conf = structure.pow(structure_power)
+    return confidence_floor + (1.0 - confidence_floor) * structure_conf
+
+
+def weighted_l1_loss(prediction, target, weight_map=None):
+    if weight_map is None:
+        return torch.abs(prediction - target).mean()
+    if weight_map.dim() == prediction.dim() - 1:
+        weight_map = weight_map.unsqueeze(-1)
+    weight_map = weight_map.to(device=prediction.device, dtype=prediction.dtype)
+    if weight_map.shape[-1] == 1 and prediction.shape[-1] != 1:
+        weight_map = weight_map.expand(*prediction.shape[:-1], prediction.shape[-1])
+    if weight_map.shape != prediction.shape:
+        raise RuntimeError(
+            f"weighted_l1_loss weight_map shape {tuple(weight_map.shape)} does not match prediction {tuple(prediction.shape)}"
+        )
+    return (torch.abs(prediction - target) * weight_map).sum() / weight_map.sum().clamp_min(1.0e-6)
+
+
+class LuminanceReconstructionLoss(BaseLossModule):
     def __init__(
         self,
-        lambda_ssim,
         weight,
         start_step=0,
         input_key="recon_hwc",
@@ -100,8 +145,7 @@ class ReconstructionLoss(BaseLossModule):
         weight_min=0.25,
         weight_max=2.0,
     ):
-        super().__init__(name="reconstruction", weight=weight, enabled=weight > 0.0, start_step=start_step)
-        self.lambda_ssim = float(lambda_ssim)
+        super().__init__(name="luminance_reconstruction", weight=weight, enabled=weight > 0.0, start_step=start_step)
         self.input_key = str(input_key)
         self.target_key = str(target_key)
         self.use_weight_map = bool(use_weight_map)
@@ -115,49 +159,139 @@ class ReconstructionLoss(BaseLossModule):
 
     def _build_weight_map(self, context, target):
         weight_map = torch.ones(target.shape[:2], device=target.device, dtype=target.dtype)
-
         shadow_weight = context.get("proxy_shadow_weight_hwc")
         if shadow_weight is not None and self.dark_boost > 0.0:
-            weight_map = weight_map + self.dark_boost * shadow_weight.to(device=target.device, dtype=target.dtype)
-
-        if self.bright_suppression > 0.0:
-            target_luma = 0.299 * target[..., 0] + 0.587 * target[..., 1] + 0.114 * target[..., 2]
-            bright_mask = (target_luma > self.bright_threshold).to(dtype=target.dtype)
-            weight_map = weight_map * (1.0 - self.bright_suppression * bright_mask)
-
-        structure = context.get("structure")
-        if structure is not None and self.confidence_floor < 1.0:
-            structure = squeeze_single_channel(structure.to(device=target.device, dtype=target.dtype), "structure")
-            structure = minmax_normalize_map(structure).clamp(0.0, 1.0)
-            structure_conf = structure.pow(self.structure_power)
-            weight_map = weight_map * (self.confidence_floor + (1.0 - self.confidence_floor) * structure_conf)
-
-        alphas = context.get("alphas")
-        if alphas is not None and self.confidence_floor < 1.0:
-            alpha_map = squeeze_single_channel(alphas.to(device=target.device, dtype=target.dtype), "alphas").clamp(0.0, 1.0)
-            weight_map = weight_map * (self.confidence_floor + (1.0 - self.confidence_floor) * alpha_map)
-
-        return weight_map.clamp(self.weight_min, self.weight_max)
+            shadow_weight = squeeze_single_channel(shadow_weight.to(device=target.device, dtype=target.dtype), "proxy_shadow_weight")
+            weight_map = weight_map + self.dark_boost * shadow_weight
+        weight_map = weight_map * build_bright_factor(target, self.bright_threshold, self.bright_suppression)
+        weight_map = weight_map * build_alpha_confidence(context, target, self.confidence_floor)
+        weight_map = weight_map * build_structure_confidence(context, target, self.confidence_floor, self.structure_power)
+        return normalize_weight_map(weight_map, self.weight_min, self.weight_max)
 
     def compute(self, context):
         target = context.get(self.target_key)
         if target is None:
-            raise RuntimeError("ReconstructionLoss requires proxy_target_hwc, but it is missing.")
+            raise RuntimeError("LuminanceReconstructionLoss requires proxy_target_hwc, but it is missing.")
         if not self.is_active(context):
             zero = zero_scalar_like(context)
             return zero, {"active": 0.0, "weight_mean": 1.0}
 
+        pred_y = rgb_to_ycbcr_hwc(context[self.input_key])[..., :1]
+        target_y = rgb_to_ycbcr_hwc(target)[..., :1]
         weight_map = self._build_weight_map(context, target) if self.use_weight_map else None
-        result = rgb_reconstruction_loss(
-            context[self.input_key],
-            target,
-            lambda_ssim=self.lambda_ssim,
-            weight_map=weight_map,
-        )
+        loss = weighted_l1_loss(pred_y, target_y, weight_map)
         weight_mean = 1.0 if weight_map is None else float(weight_map.detach().mean().item())
-        return result["total"], {
-            "l1": float(result["l1"].detach().item()),
-            "ssim": float(result["ssim"].detach().item()),
+        return loss, {
+            "l1": float(loss.detach().item()),
+            "active": 1.0,
+            "weight_mean": weight_mean,
+        }
+
+
+class ChromaReconstructionLoss(BaseLossModule):
+    def __init__(
+        self,
+        weight,
+        start_step=0,
+        input_key="recon_hwc",
+        target_key="proxy_target_hwc",
+        reference_key="supervision_hwc",
+        use_weight_map=False,
+        bright_threshold=0.70,
+        bright_suppression=0.0,
+        confidence_floor=0.45,
+        structure_power=1.0,
+        weight_min=0.20,
+        weight_max=1.50,
+        shadow_power=0.5,
+        global_mean_weight=0.0,
+        proxy_blend=1.0,
+        cb_weight=1.0,
+        cr_weight=1.0,
+    ):
+        super().__init__(name="chroma_reconstruction", weight=weight, enabled=weight > 0.0, start_step=start_step)
+        self.input_key = str(input_key)
+        self.target_key = str(target_key)
+        self.reference_key = str(reference_key)
+        self.use_weight_map = bool(use_weight_map)
+        self.bright_threshold = float(bright_threshold)
+        self.bright_suppression = float(bright_suppression)
+        self.confidence_floor = float(confidence_floor)
+        self.structure_power = float(structure_power)
+        self.weight_min = float(weight_min)
+        self.weight_max = float(weight_max)
+        self.shadow_power = float(max(1.0e-3, shadow_power))
+        self.global_mean_weight = float(max(0.0, global_mean_weight))
+        self.proxy_blend = float(min(max(proxy_blend, 0.0), 1.0))
+        self.cb_weight = float(max(0.0, cb_weight))
+        self.cr_weight = float(max(0.0, cr_weight))
+
+    def _build_weight_map(self, context, target):
+        weight_map = build_bright_factor(target, self.bright_threshold, self.bright_suppression)
+        weight_map = weight_map * build_alpha_confidence(context, target, self.confidence_floor)
+        weight_map = weight_map * build_structure_confidence(context, target, self.confidence_floor, self.structure_power)
+        shadow_weight = context.get("proxy_shadow_weight_hwc")
+        if shadow_weight is not None:
+            shadow_weight = squeeze_single_channel(shadow_weight.to(device=target.device, dtype=target.dtype), "proxy_shadow_weight").clamp(0.0, 1.0)
+            color_conf = (1.0 - shadow_weight).pow(self.shadow_power)
+            color_conf = self.confidence_floor + (1.0 - self.confidence_floor) * color_conf
+            weight_map = weight_map * color_conf
+        return normalize_weight_map(weight_map, self.weight_min, self.weight_max)
+
+    def compute(self, context):
+        target = context.get(self.target_key)
+        if target is None:
+            raise RuntimeError("ChromaReconstructionLoss requires proxy_target_hwc, but it is missing.")
+        if not self.is_active(context):
+            zero = zero_scalar_like(context)
+            return zero, {"active": 0.0, "weight_mean": 1.0}
+
+        pred_cbcr = rgb_to_ycbcr_hwc(context[self.input_key])[..., 1:]
+        proxy_cbcr = rgb_to_ycbcr_hwc(target)[..., 1:]
+        target_cbcr = proxy_cbcr
+        reference = context.get(self.reference_key)
+        if reference is not None:
+            reference_cbcr = rgb_to_ycbcr_hwc(reference)[..., 1:]
+            if self.proxy_blend <= 0.0:
+                target_cbcr = reference_cbcr
+            elif self.proxy_blend < 1.0:
+                target_cbcr = self.proxy_blend * proxy_cbcr + (1.0 - self.proxy_blend) * reference_cbcr
+        weight_map = self._build_weight_map(context, target) if self.use_weight_map else None
+        diff = torch.abs(pred_cbcr - target_cbcr)
+        channel_weights = pred_cbcr.new_tensor([self.cb_weight, self.cr_weight]).view(1, 1, 2)
+        weighted_diff = diff * channel_weights
+        if weight_map is not None:
+            expanded_weight_map = weight_map.unsqueeze(-1).expand_as(weighted_diff)
+            pixel_loss = (weighted_diff * expanded_weight_map).sum() / expanded_weight_map.sum().clamp_min(1.0e-6)
+        else:
+            pixel_loss = weighted_diff.mean()
+        global_mean_loss = torch.zeros((), device=pred_cbcr.device, dtype=pred_cbcr.dtype)
+        if self.global_mean_weight > 0.0:
+            pred_global_mean = pred_cbcr.mean(dim=(0, 1))
+            target_global_mean = target_cbcr.mean(dim=(0, 1))
+            global_mean_loss = (torch.abs(pred_global_mean - target_global_mean) * channel_weights.view(-1)).mean()
+        loss = pixel_loss + self.global_mean_weight * global_mean_loss
+        if weight_map is not None:
+            cb_l1 = (diff[..., 0] * weight_map).sum() / weight_map.sum().clamp_min(1.0e-6)
+            cr_l1 = (diff[..., 1] * weight_map).sum() / weight_map.sum().clamp_min(1.0e-6)
+        else:
+            cb_l1 = diff[..., 0].mean()
+            cr_l1 = diff[..., 1].mean()
+        weight_mean = 1.0 if weight_map is None else float(weight_map.detach().mean().item())
+        pred_global_mean = pred_cbcr.detach().mean(dim=(0, 1))
+        target_global_mean = target_cbcr.detach().mean(dim=(0, 1))
+        return loss, {
+            "l1": float(pixel_loss.detach().item()),
+            "global_mean": float(global_mean_loss.detach().item()),
+            "cb_l1": float(cb_l1.detach().item()),
+            "cr_l1": float(cr_l1.detach().item()),
+            "cb_global_mean_pred": float(pred_global_mean[0].item()),
+            "cr_global_mean_pred": float(pred_global_mean[1].item()),
+            "cb_global_mean_tgt": float(target_global_mean[0].item()),
+            "cr_global_mean_tgt": float(target_global_mean[1].item()),
+            "cb_weight": float(self.cb_weight),
+            "cr_weight": float(self.cr_weight),
+            "proxy_blend": float(self.proxy_blend),
             "active": 1.0,
             "weight_mean": weight_mean,
         }
@@ -231,6 +365,12 @@ class SparsePointRegularizationLoss(BaseLossModule):
         robust_scale=0.05,
         knn_k=3,
         knn_eps=1.0e-6,
+        meta_enabled=True,
+        density_k=8,
+        density_clamp_min=0.5,
+        density_clamp_max=2.0,
+        quality_error_scale_mode="median",
+        quality_track_mode="log_median_norm",
     ):
         super().__init__(name="sparse_guided", weight=weight, enabled=weight > 0.0, start_step=start_step)
         self.sample_points = int(max(1, sample_points))
@@ -238,6 +378,84 @@ class SparsePointRegularizationLoss(BaseLossModule):
         self.robust_scale = float(max(0.0, robust_scale))
         self.knn_k = int(max(1, knn_k))
         self.knn_eps = float(max(1.0e-12, knn_eps))
+        self.meta_enabled = bool(meta_enabled)
+        self.density_k = int(max(1, density_k))
+        self.density_clamp_min = float(density_clamp_min)
+        self.density_clamp_max = float(density_clamp_max)
+        self.quality_error_scale_mode = str(quality_error_scale_mode).lower()
+        self.quality_track_mode = str(quality_track_mode).lower()
+        self._cached_support_key = None
+        self._cached_quality_score = None
+        self._cached_density_score = None
+        self._cached_support_score = None
+
+    def _support_cache_key(self, sparse_points, track_len, reproj_error):
+        return (
+            int(sparse_points.data_ptr()),
+            int(track_len.data_ptr()) if track_len is not None else -1,
+            int(reproj_error.data_ptr()) if reproj_error is not None else -1,
+            tuple(sparse_points.shape),
+        )
+
+    def _compute_density_radius(self, sparse_points):
+        num_points = int(sparse_points.shape[0])
+        if num_points <= 1:
+            return torch.ones((num_points,), device=sparse_points.device, dtype=sparse_points.dtype)
+        knn_k = min(self.density_k + 1, num_points)
+        radii = []
+        chunk_size = 1024
+        for start in range(0, num_points, chunk_size):
+            end = min(start + chunk_size, num_points)
+            chunk = sparse_points[start:end]
+            distances = torch.cdist(chunk, sparse_points)
+            knn_dist = torch.topk(distances, k=knn_k, dim=1, largest=False).values
+            if knn_k > 1:
+                local_radius = knn_dist[:, 1:].mean(dim=1)
+            else:
+                local_radius = knn_dist[:, 0]
+            radii.append(local_radius)
+        return torch.cat(radii, dim=0)
+
+    def _get_sparse_support_scores(self, sparse_points, track_len, reproj_error):
+        if not self.meta_enabled or track_len is None or reproj_error is None:
+            ones = torch.ones((sparse_points.shape[0],), device=sparse_points.device, dtype=sparse_points.dtype)
+            return ones, ones, ones
+
+        cache_key = self._support_cache_key(sparse_points, track_len, reproj_error)
+        if self._cached_support_key == cache_key:
+            return self._cached_quality_score, self._cached_density_score, self._cached_support_score
+
+        track_len = track_len.reshape(-1).to(device=sparse_points.device, dtype=sparse_points.dtype).clamp_min(0.0)
+        reproj_error = reproj_error.reshape(-1).to(device=sparse_points.device, dtype=sparse_points.dtype).clamp_min(0.0)
+
+        track_score = torch.log1p(track_len)
+        if self.quality_track_mode == "log_median_norm":
+            positive_track = track_score[track_score > 0.0]
+            track_median = positive_track.median() if positive_track.numel() > 0 else torch.tensor(1.0, device=track_score.device, dtype=track_score.dtype)
+            track_score = track_score / track_median.clamp_min(self.knn_eps)
+
+        if self.quality_error_scale_mode == "median":
+            positive_error = reproj_error[reproj_error > 0.0]
+            if positive_error.numel() > 0:
+                error_scale = positive_error.median()
+            else:
+                error_scale = torch.tensor(1.0, device=reproj_error.device, dtype=reproj_error.dtype)
+        else:
+            error_scale = reproj_error.mean() if reproj_error.numel() > 0 else torch.tensor(1.0, device=reproj_error.device, dtype=reproj_error.dtype)
+        error_score = torch.exp(-reproj_error / error_scale.clamp_min(self.knn_eps))
+        quality_score = (track_score * error_score).clamp_min(self.knn_eps)
+
+        density_radius = self._compute_density_radius(sparse_points)
+        positive_radius = density_radius[density_radius > 0.0]
+        radius_median = positive_radius.median() if positive_radius.numel() > 0 else torch.tensor(1.0, device=density_radius.device, dtype=density_radius.dtype)
+        density_score = (radius_median / density_radius.clamp_min(self.knn_eps)).clamp(self.density_clamp_min, self.density_clamp_max)
+
+        support_score = quality_score * density_score
+        self._cached_support_key = cache_key
+        self._cached_quality_score = quality_score
+        self._cached_density_score = density_score
+        self._cached_support_score = support_score
+        return quality_score, density_score, support_score
 
     def compute(self, context):
         if not self.is_active(context):
@@ -245,6 +463,8 @@ class SparsePointRegularizationLoss(BaseLossModule):
             return zero, {"active": 0.0, "sampled": 0.0, "distance_mean": 0.0}
 
         sparse_points = context.get("colmap_sparse_points")
+        sparse_track_len = context.get("colmap_sparse_track_len")
+        sparse_reproj_error = context.get("colmap_sparse_reproj_error")
         means = context.get("gaussian_means")
         opacities = context.get("gaussian_opacities")
         if sparse_points is None:
@@ -267,11 +487,18 @@ class SparsePointRegularizationLoss(BaseLossModule):
             active_indices = active_indices[perm]
         sampled_means = means[active_indices]
 
+        quality_score, density_score, support_score = self._get_sparse_support_scores(
+            sparse_points,
+            sparse_track_len,
+            sparse_reproj_error,
+        )
+
         distances = torch.cdist(sampled_means, sparse_points)
         knn_k = min(self.knn_k, int(sparse_points.shape[0]))
         knn_dist, knn_idx = torch.topk(distances, k=knn_k, dim=1, largest=False)
         knn_points = sparse_points[knn_idx]
-        knn_weights = 1.0 / knn_dist.clamp_min(self.knn_eps)
+        knn_support = support_score[knn_idx]
+        knn_weights = knn_support / knn_dist.clamp_min(self.knn_eps)
         knn_weights = knn_weights / knn_weights.sum(dim=1, keepdim=True).clamp_min(self.knn_eps)
         target_points = (knn_points * knn_weights.unsqueeze(-1)).sum(dim=1)
         target_dist = torch.norm(sampled_means - target_points, dim=1)
@@ -290,6 +517,9 @@ class SparsePointRegularizationLoss(BaseLossModule):
             "robust_mean": float(robust_loss.detach().mean().item()),
             "robust_scale": float(self.robust_scale),
             "opacity_mean": float(sampled_opacity.detach().mean().item()),
+            "quality_score_mean": float(quality_score.detach().mean().item()),
+            "density_score_mean": float(density_score.detach().mean().item()),
+            "support_score_mean": float(support_score.detach().mean().item()),
         }
 
 

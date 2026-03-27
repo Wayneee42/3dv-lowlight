@@ -1,0 +1,132 @@
+\documentclass[10pt,a4paper]{article}
+
+\usepackage[margin=0.85in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{xcolor}
+
+\hypersetup{
+  colorlinks=true,
+  urlcolor=blue,
+  linkcolor=blue
+}
+
+\title{\textbf{NTIRE 2026 3D Scene Relighting Challenge Factsheet}\\
+\large Team 3dv lowlight}
+\author{Haojie Guo}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Team Information}
+\textbf{Team name:} 3dv lowlight\\
+\textbf{Member(s):} Haojie Guo
+
+\section{Method Overview}
+Our final solution is a three-stage low-light 3D Gaussian Splatting pipeline:
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{stage4\_tuned\_colmap}: geometry bootstrap with fixed-pose COLMAP sparse initialization and weak geometric priors.
+  \item \textbf{stage5b\_ft}: no-densify structure refinement with weak sparse-guided geometry regularization.
+  \item \textbf{stage6\_adaptive\_chroma\_ycbcr\_additive}: appearance refinement with adaptive proxy-target calibration, confidence-aware reconstruction weighting, Y-only illumination, and additive YCbCr chroma residual.
+\end{enumerate}
+
+\section{Pipeline and Main Modules}
+The full system is organized as a staged geometry-to-appearance pipeline:
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Stage 1} provides a stable geometry bootstrap using fixed-pose sparse points plus weak depth and weak multiview priors.
+  \item \textbf{Stage 2} refines geometry without densification and keeps sparse points as weak training-time anchors.
+  \item \textbf{Stage 3} keeps the geometry from Stage 2 and focuses on low-light appearance restoration through adaptive relighting and chroma correction.
+\end{enumerate}
+
+The retained design follows two main ideas. First, geometry should rely more on multi-view sparse consistency than on strong monocular-depth-only initialization. Second, the final appearance stage should decouple luminance recovery from chroma correction. We tested stronger monocular-depth initialization, occupancy-guided initialization, merged stage-4/5 optimization, canonical calibration variants, and color-checker-based refinements, but they were less stable or less competitive than the retained pipeline.
+
+\subsection{Stage 1: \texttt{stage4\_tuned\_colmap}}
+Stage 1 writes official dataset poses into a manual COLMAP model and triangulates sparse points from enhanced training views. These sparse points are combined with random points to initialize Gaussians. During training, RGB reconstruction with SSIM is used as the main supervision, together with weak exposure regularization, weak Marigold depth prior, and weak multiview reprojection consistency. Densification is only used in the early period.
+
+\subsection{Stage 2: \texttt{stage5b\_ft}}
+Stage 2 warm-starts from Stage 1 and disables densification. Its goal is to refine geometry and stabilize structure. In addition to RGB reconstruction, weak depth prior, and structure prior, this stage reuses COLMAP sparse points as a weak geometric anchor during training. The retained sparse-guided regularization uses a Charbonnier-style robust loss and a small $k$-NN neighborhood, while sparse support weights are modulated by COLMAP track length, reprojection error, and local sparse density. This makes the training-time sparse anchor smoother and more selective than a hard nearest-point constraint.
+
+\subsection{Stage 3: \texttt{stage6\_adaptive\_chroma\_ycbcr\_additive}}
+Stage 3 warm-starts from Stage 2 and focuses on appearance restoration. We use an adaptively calibrated proxy relighting target, confidence-aware reconstruction weighting, an illumination head that directly modulates only the luminance $Y$ channel in YCbCr space, and an additive chroma branch that corrects $Cb/Cr$ separately. In other words, brightness recovery and chroma correction are explicitly decoupled in the final stage.
+
+\section{Training and Inference Settings}
+\subsection{Training schedule}
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{Stage 1:} 15{,}000 iterations
+  \item \textbf{Stage 2:} 5{,}000 iterations
+  \item \textbf{Stage 3:} 5{,}000 iterations
+\end{itemize}
+
+Other retained settings:
+\begin{itemize}[leftmargin=2em]
+  \item initial Gaussian count: 100{,}000
+  \item SH degree: 3
+  \item scene scale: 2.0
+  \item Stage 1 uses early densification; Stage 2 and Stage 3 do not densify
+  \item Stage 2 uses weak sparse-guided regularization with robust $k$-NN support and sparse quality/density-aware weighting
+  \item Stage 3 uses decoupled supervision: luminance is guided by the proxy relighting target, while chroma is corrected by a separate YCbCr residual branch
+\end{itemize}
+
+\subsection{Inference}
+Inference is performed by loading a trained checkpoint and rendering test views with \texttt{eval.py}. The final submissions are built from the rendered \texttt{test\_\*.png} images after the retained third stage.
+
+\section{External Data, Pretrained Models, and Additional Priors}
+\textbf{No additional external paired relighting dataset is used for training.} The method is trained on the provided challenge scenes only.
+
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{Marigold} is used as a pretrained monocular depth estimator to produce depth priors.
+  \item \textbf{Depth prior:} Marigold depth stored in \texttt{auxiliaries/depth}
+  \item \textbf{Structure prior:} illumination-invariant structure prior stored in \texttt{auxiliaries/structure}
+  \item \textbf{Sparse prior:} fixed-pose COLMAP sparse points stored in \texttt{auxiliaries/colmap\_sparse}
+\end{itemize}
+
+\section{Runtime and Hardware Environment}
+\begin{itemize}[leftmargin=2em]
+  \item OS: Ubuntu 22.04
+  \item Python: 3.10
+  \item PyTorch: 2.5.1 + CUDA 12.1
+  \item Main package dependencies include: \texttt{torch}, \texttt{torchvision}, \texttt{gsplat}, \texttt{omegaconf}, \texttt{PyYAML}, \texttt{tqdm}, \texttt{Pillow}, \texttt{jaxtyping}, and \texttt{rich}
+  \item Training was conducted on a single AutoDL cloud GPU instance (vGPU-32GB class).
+\end{itemize}
+
+Approximate runtime for one scene:
+\begin{itemize}[leftmargin=2em]
+  \item one Marigold depth extraction pass: about 30 seconds,
+  \item one structure-prior extraction pass: less than 10 seconds,
+  \item one fixed-pose COLMAP sparse triangulation pass: about 3 minutes,
+  \item and three training stages (15k + 5k + 5k iterations): about 35--40 minutes.
+\end{itemize}
+
+\section{Code Link and Entry Points}
+\textbf{GitHub repository:} \url{https://github.com/Wayneee42/3dv-lowlight}
+
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{train.py}: training entry point for all three retained stages
+  \item \texttt{eval.py}: rendering and evaluation entry point
+  \item \texttt{config/stage4\_tuned\_colmap/}: Stage 1 configurations
+  \item \texttt{config/stage5b\_ft/}: Stage 2 configurations
+  \item \texttt{config/stage6\_adaptive\_chroma\_ycbcr\_additive/}: Stage 3 configurations
+  \item \texttt{tools/build\_fixed\_pose\_colmap\_sparse\_init.py}: fixed-pose sparse point generation
+  \item \texttt{tools/extract\_marigold\_depth.py}: depth prior extraction
+  \item \texttt{tools/extract\_structure\_prior.py}: structure prior extraction
+\end{itemize}
+
+The retained code pipeline is:
+\begin{enumerate}[leftmargin=2em]
+  \item Generate depth prior with Marigold
+  \item Generate structure prior
+  \item Generate fixed-pose COLMAP sparse points
+  \item Train \texttt{stage4\_tuned\_colmap}
+  \item Train \texttt{stage5b\_ft}
+  \item Train \texttt{stage6\_adaptive\_chroma\_ycbcr\_additive}
+\end{enumerate}
+
+\section{Summary}
+This system is a staged low-light 3DGS pipeline that combines fixed-pose COLMAP sparse initialization, sparse quality/density-aware weak geometry regularization, and a decoupled final appearance stage with Y-only illumination and additive YCbCr chroma residual. The code released in the repository corresponds to this retained pipeline.
+
+\end{document}

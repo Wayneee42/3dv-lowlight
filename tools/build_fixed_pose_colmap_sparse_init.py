@@ -371,24 +371,38 @@ def write_manual_model(manual_dir: Path, metadata: dict, image_rows):
     return camera_id
 
 
-def parse_points3d_bin(points_path: Path) -> np.ndarray:
+def parse_points3d_bin(points_path: Path):
     points = []
+    track_lengths = []
+    reproj_errors = []
     with points_path.open('rb') as handle:
         num_points = struct.unpack('<Q', handle.read(8))[0]
         for _ in range(num_points):
             handle.read(8)  # point3D_id
             xyz = struct.unpack('<ddd', handle.read(24))
             handle.read(3)  # rgb
-            handle.read(8)  # error
+            error = struct.unpack('<d', handle.read(8))[0]
             track_len = struct.unpack('<Q', handle.read(8))[0]
             handle.read(8 * track_len)
             points.append(xyz)
+            track_lengths.append(float(track_len))
+            reproj_errors.append(float(error))
     if not points:
-        return np.zeros((0, 3), dtype=np.float32)
-    return np.asarray(points, dtype=np.float32)
+        empty_xyz = np.zeros((0, 3), dtype=np.float32)
+        empty_meta = np.zeros((0,), dtype=np.float32)
+        return {
+            'xyz': empty_xyz,
+            'track_len': empty_meta,
+            'reproj_error': empty_meta,
+        }
+    return {
+        'xyz': np.asarray(points, dtype=np.float32),
+        'track_len': np.asarray(track_lengths, dtype=np.float32),
+        'reproj_error': np.asarray(reproj_errors, dtype=np.float32),
+    }
 
 
-def parse_points3d_txt(points_path: Path) -> np.ndarray:
+def parse_points3d_txt(points_path: Path):
     points = []
     with points_path.open('r', encoding='utf-8') as handle:
         for line in handle:
@@ -400,11 +414,23 @@ def parse_points3d_txt(points_path: Path) -> np.ndarray:
                 continue
             points.append([float(fields[1]), float(fields[2]), float(fields[3])])
     if not points:
-        return np.zeros((0, 3), dtype=np.float32)
-    return np.asarray(points, dtype=np.float32)
+        empty_xyz = np.zeros((0, 3), dtype=np.float32)
+        empty_meta = np.zeros((0,), dtype=np.float32)
+        return {
+            'xyz': empty_xyz,
+            'track_len': empty_meta,
+            'reproj_error': empty_meta,
+        }
+    xyz = np.asarray(points, dtype=np.float32)
+    count = int(xyz.shape[0])
+    return {
+        'xyz': xyz,
+        'track_len': np.ones((count,), dtype=np.float32),
+        'reproj_error': np.ones((count,), dtype=np.float32),
+    }
 
 
-def load_sparse_points(model_dir: Path) -> np.ndarray:
+def load_sparse_points(model_dir: Path):
     bin_path = model_dir / 'points3D.bin'
     txt_path = model_dir / 'points3D.txt'
     if bin_path.exists():
@@ -426,6 +452,7 @@ def build_sparse_model(scene_root: Path, config_path: Path, colmap_bin: str, wor
     database_path = workspace_dir / 'database.db'
     report_path = workspace_dir / 'report.json'
     points_path = workspace_dir / 'points.npy'
+    points_meta_path = workspace_dir / 'points_meta.npz'
 
     colmap_exec = resolve_colmap_binary(colmap_bin)
     colmap_version = ensure_supported_colmap_version(colmap_exec)
@@ -517,8 +544,10 @@ def build_sparse_model(scene_root: Path, config_path: Path, colmap_bin: str, wor
     ]
     run_command(filtering_cmd, cwd=workspace_dir)
 
-    raw_points = load_sparse_points(sparse_raw_dir)
-    filtered_points = load_sparse_points(sparse_dir)
+    raw_sparse = load_sparse_points(sparse_raw_dir)
+    filtered_sparse = load_sparse_points(sparse_dir)
+    raw_points = raw_sparse['xyz']
+    filtered_points = filtered_sparse['xyz']
 
     model_cfg = dict_to_namespace(config_data.get('MODEL', {}))
     min_points = int(getattr(model_cfg, 'INIT_COLMAP_MIN_POINTS', 1000))
@@ -528,6 +557,15 @@ def build_sparse_model(scene_root: Path, config_path: Path, colmap_bin: str, wor
         )
 
     np.save(points_path, filtered_points.astype(np.float32))
+    np.savez(
+        points_meta_path,
+        xyz=filtered_sparse['xyz'].astype(np.float32),
+        track_len=filtered_sparse['track_len'].astype(np.float32),
+        reproj_error=filtered_sparse['reproj_error'].astype(np.float32),
+    )
+
+    filtered_track_len = filtered_sparse['track_len']
+    filtered_reproj_error = filtered_sparse['reproj_error']
     report = {
         'scene_root': str(scene_root),
         'config_path': str(config_path),
@@ -539,7 +577,13 @@ def build_sparse_model(scene_root: Path, config_path: Path, colmap_bin: str, wor
         'two_view_geometry_count': int(two_view_count),
         'triangulated_points_raw': int(raw_points.shape[0]),
         'triangulated_points_filtered': int(filtered_points.shape[0]),
+        'num_sparse_points': int(filtered_points.shape[0]),
+        'track_len_mean': float(filtered_track_len.mean()) if filtered_track_len.size > 0 else 0.0,
+        'track_len_median': float(np.median(filtered_track_len)) if filtered_track_len.size > 0 else 0.0,
+        'reproj_error_mean': float(filtered_reproj_error.mean()) if filtered_reproj_error.size > 0 else 0.0,
+        'reproj_error_median': float(np.median(filtered_reproj_error)) if filtered_reproj_error.size > 0 else 0.0,
         'points_path': str(points_path),
+        'points_meta_path': str(points_meta_path),
         'workspace_dir': str(workspace_dir),
     }
     report_path.write_text(json.dumps(report, indent=2), encoding='utf-8')
