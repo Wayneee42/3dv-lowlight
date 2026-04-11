@@ -1,3 +1,5 @@
+import math
+
 from core.libs.losses import (
     chroma_delta_from_aux,
     chroma_factor_from_aux,
@@ -8,6 +10,59 @@ from core.libs.losses import (
 )
 import torch
 import torch.nn.functional as F
+
+
+def _quantile_logs(name, values, quantiles):
+    flattened = values.detach().reshape(-1)
+    if flattened.numel() == 0:
+        return {f"{name}_{label}": 0.0 for _, label in quantiles}
+    q_values = torch.tensor([float(q) for q, _ in quantiles], device=flattened.device, dtype=flattened.dtype)
+    q_result = torch.quantile(flattened, q_values)
+    return {
+        f"{name}_{label}": float(q_result[idx].item())
+        for idx, (_, label) in enumerate(quantiles)
+    }
+
+
+def _masked_mean(values, mask):
+    if values.numel() == 0 or mask.numel() == 0:
+        return 0.0
+    valid_mask = mask.detach().reshape(-1).bool()
+    if not bool(valid_mask.any().item()):
+        return 0.0
+    return float(values.detach().reshape(-1)[valid_mask].mean().item())
+
+
+def _masked_quantile_logs(name, values, mask, quantiles):
+    if values.numel() == 0 or mask.numel() == 0:
+        return {f"{name}_{label}": 0.0 for _, label in quantiles}
+    valid_mask = mask.detach().reshape(-1).bool()
+    if not bool(valid_mask.any().item()):
+        return {f"{name}_{label}": 0.0 for _, label in quantiles}
+    return _quantile_logs(name, values.detach().reshape(-1)[valid_mask], quantiles)
+
+
+def _quaternion_to_rotation_matrix(quats):
+    quats = F.normalize(quats, dim=-1, eps=1.0e-12)
+    w, x, y, z = quats.unbind(dim=-1)
+    ww, xx, yy, zz = w * w, x * x, y * y, z * z
+    wx, wy, wz = w * x, w * y, w * z
+    xy, xz, yz = x * y, x * z, y * z
+    return torch.stack(
+        [
+            ww + xx - yy - zz,
+            2.0 * (xy - wz),
+            2.0 * (xz + wy),
+            2.0 * (xy + wz),
+            ww - xx + yy - zz,
+            2.0 * (yz - wx),
+            2.0 * (xz - wy),
+            2.0 * (yz + wx),
+            ww - xx - yy + zz,
+        ],
+        dim=-1,
+    ).reshape(quats.shape[0], 3, 3)
+
 
 class BaseLossModule:
     def __init__(
@@ -208,6 +263,8 @@ class ChromaReconstructionLoss(BaseLossModule):
         proxy_blend=1.0,
         cb_weight=1.0,
         cr_weight=1.0,
+        cb_target_bias=0.0,
+        cr_target_bias=0.0,
     ):
         super().__init__(name="chroma_reconstruction", weight=weight, enabled=weight > 0.0, start_step=start_step)
         self.input_key = str(input_key)
@@ -225,6 +282,8 @@ class ChromaReconstructionLoss(BaseLossModule):
         self.proxy_blend = float(min(max(proxy_blend, 0.0), 1.0))
         self.cb_weight = float(max(0.0, cb_weight))
         self.cr_weight = float(max(0.0, cr_weight))
+        self.cb_target_bias = float(cb_target_bias)
+        self.cr_target_bias = float(cr_target_bias)
 
     def _build_weight_map(self, context, target):
         weight_map = build_bright_factor(target, self.bright_threshold, self.bright_suppression)
@@ -256,6 +315,11 @@ class ChromaReconstructionLoss(BaseLossModule):
                 target_cbcr = reference_cbcr
             elif self.proxy_blend < 1.0:
                 target_cbcr = self.proxy_blend * proxy_cbcr + (1.0 - self.proxy_blend) * reference_cbcr
+        if self.cb_target_bias != 0.0 or self.cr_target_bias != 0.0:
+            target_cbcr = target_cbcr.clone()
+            target_cbcr[..., 0] = target_cbcr[..., 0] + self.cb_target_bias
+            target_cbcr[..., 1] = target_cbcr[..., 1] + self.cr_target_bias
+            target_cbcr = target_cbcr.clamp(-0.5, 0.5)
         weight_map = self._build_weight_map(context, target) if self.use_weight_map else None
         diff = torch.abs(pred_cbcr - target_cbcr)
         channel_weights = pred_cbcr.new_tensor([self.cb_weight, self.cr_weight]).view(1, 1, 2)
@@ -291,6 +355,8 @@ class ChromaReconstructionLoss(BaseLossModule):
             "cr_global_mean_tgt": float(target_global_mean[1].item()),
             "cb_weight": float(self.cb_weight),
             "cr_weight": float(self.cr_weight),
+            "cb_target_bias": float(self.cb_target_bias),
+            "cr_target_bias": float(self.cr_target_bias),
             "proxy_blend": float(self.proxy_blend),
             "active": 1.0,
             "weight_mean": weight_mean,
@@ -360,6 +426,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
         self,
         weight,
         start_step=0,
+        end_step=None,
         sample_points=1024,
         min_opacity=0.2,
         robust_scale=0.05,
@@ -371,8 +438,73 @@ class SparsePointRegularizationLoss(BaseLossModule):
         density_clamp_max=2.0,
         quality_error_scale_mode="median",
         quality_track_mode="log_median_norm",
+        mode="point_to_barycenter",
+        plane_k=8,
+        plane_eps=1.0e-6,
+        plane_min_eigen_gap=1.0e-4,
+        tangent_weight=0.15,
+        normal_scale_weight=0.0,
+        sampling_mode="random",
+        hard_ratio=0.5,
+        difficulty_score="min_sparse_dist",
+        random_sample_fallback=True,
+        global_mining_chunk_size=4096,
+        global_mining_refresh_interval=25,
+        reliability_filter_enabled=False,
+        lowlight_brightness_enabled=True,
+        lowlight_gradient_enabled=True,
+        weight_schedule="constant",
+        weight_start_scale=1.0,
+        weight_end_scale=1.0,
+        weight_decay_end_step=None,
+        orientation_enabled=False,
+        orientation_weight=0.0,
+        anisotropic_scale_target_enabled=False,
+        anisotropic_scale_target_weight=0.0,
+        tangent_scale_ratio=0.9,
+        normal_scale_ratio=0.24,
+        target_tangent_scale_min=0.005,
+        target_tangent_scale_max=0.05,
+        target_normal_scale_min=0.002,
+        target_normal_scale_max=0.02,
+        target_tangent_quantile=0.75,
+        target_normal_quantile=0.75,
+        target_tangent_std_blend=0.75,
+        target_tangent_std_cap_ratio=1.6,
+        target_tangent_local_radius_cap_ratio=0.85,
+        target_tangent_std_floor_ratio=1.0,
+        tail_start_step=None,
+        tail_weight_hold_end_step=None,
+        tail_light_mode_enabled=False,
+        tail_sampling_mode=None,
+        tail_hard_ratio=None,
+        tail_random_sample_fallback=None,
+        tail_min_plane_confidence=0.35,
+        tail_global_mining_refresh_interval=None,
+        tail_candidate_subset_ratio=1.0,
+        tail_candidate_subset_min=None,
+        tail_candidate_subset_max=None,
+        tail_stable_sample_ratio_floor=0.5,
+        tail_keep_point_to_plane=True,
+        tail_point_to_plane_no_fallback=True,
+        tail_point_to_plane_min_confidence=0.35,
+        tail_point_to_plane_confidence_power=1.0,
+        tail_point_to_plane_weight_scale=0.2,
+        tail_keep_orientation=True,
+        tail_keep_anisotropic_scale=True,
+        tail_keep_normal_scale=True,
+        tail_difficulty_score="stable_surface_mixed",
+        tail_difficulty_distance_weight=0.75,
+        tail_difficulty_orientation_weight=0.75,
+        tail_difficulty_scale_weight=1.25,
+        tail_difficulty_normal_weight=0.5,
+        tail_difficulty_confidence_weight=1.0,
+        difficulty_distance_weight=1.0,
+        difficulty_orientation_weight=0.5,
+        difficulty_scale_weight=1.0,
+        difficulty_normal_weight=0.5,
     ):
-        super().__init__(name="sparse_guided", weight=weight, enabled=weight > 0.0, start_step=start_step)
+        super().__init__(name="sparse_guided", weight=weight, enabled=weight > 0.0, start_step=start_step, end_step=end_step)
         self.sample_points = int(max(1, sample_points))
         self.min_opacity = float(min_opacity)
         self.robust_scale = float(max(0.0, robust_scale))
@@ -384,16 +516,111 @@ class SparsePointRegularizationLoss(BaseLossModule):
         self.density_clamp_max = float(density_clamp_max)
         self.quality_error_scale_mode = str(quality_error_scale_mode).lower()
         self.quality_track_mode = str(quality_track_mode).lower()
+        self.mode = str(mode).lower()
+        self.plane_k = int(max(3, plane_k))
+        self.plane_eps = float(max(1.0e-12, plane_eps))
+        self.plane_min_eigen_gap = float(max(0.0, plane_min_eigen_gap))
+        self.tangent_weight = float(max(0.0, tangent_weight))
+        self.normal_scale_weight = float(max(0.0, normal_scale_weight))
+        self.sampling_mode = str(sampling_mode).lower()
+        self.hard_ratio = float(min(max(hard_ratio, 0.0), 1.0))
+        self.difficulty_score = str(difficulty_score).lower()
+        self.random_sample_fallback = bool(random_sample_fallback)
+        self.global_mining_chunk_size = int(max(64, global_mining_chunk_size))
+        self.global_mining_refresh_interval = int(max(1, global_mining_refresh_interval))
+        self.reliability_filter_enabled = bool(reliability_filter_enabled)
+        self.lowlight_brightness_enabled = bool(lowlight_brightness_enabled)
+        self.lowlight_gradient_enabled = bool(lowlight_gradient_enabled)
+        self.weight_schedule = str(weight_schedule).lower()
+        self.weight_start_scale = float(max(0.0, weight_start_scale))
+        self.weight_end_scale = float(max(0.0, weight_end_scale))
+        self.weight_decay_end_step = None if weight_decay_end_step is None else int(weight_decay_end_step)
+        self.orientation_enabled = bool(orientation_enabled)
+        self.orientation_weight = float(max(0.0, orientation_weight))
+        self.anisotropic_scale_target_enabled = bool(anisotropic_scale_target_enabled)
+        self.anisotropic_scale_target_weight = float(max(0.0, anisotropic_scale_target_weight))
+        self.tangent_scale_ratio = float(max(0.0, tangent_scale_ratio))
+        self.normal_scale_ratio = float(max(0.0, normal_scale_ratio))
+        self.target_tangent_scale_min = float(max(0.0, target_tangent_scale_min))
+        self.target_tangent_scale_max = float(max(self.target_tangent_scale_min, target_tangent_scale_max))
+        self.target_normal_scale_min = float(max(0.0, target_normal_scale_min))
+        self.target_normal_scale_max = float(max(self.target_normal_scale_min, target_normal_scale_max))
+        self.target_tangent_quantile = float(min(max(target_tangent_quantile, 0.0), 1.0))
+        self.target_normal_quantile = float(min(max(target_normal_quantile, 0.0), 1.0))
+        self.target_tangent_std_blend = float(min(max(target_tangent_std_blend, 0.0), 1.0))
+        self.target_tangent_std_cap_ratio = float(max(1.0, target_tangent_std_cap_ratio))
+        self.target_tangent_local_radius_cap_ratio = float(max(0.0, target_tangent_local_radius_cap_ratio))
+        self.target_tangent_std_floor_ratio = float(max(0.0, target_tangent_std_floor_ratio))
+        self.tail_start_step = int(self.start_step if tail_start_step is None else max(self.start_step, int(tail_start_step)))
+        self.tail_weight_hold_end_step = (
+            None if tail_weight_hold_end_step is None else int(max(self.tail_start_step, int(tail_weight_hold_end_step)))
+        )
+        self.tail_light_mode_enabled = bool(tail_light_mode_enabled)
+        self.tail_sampling_mode = self.sampling_mode if tail_sampling_mode is None else str(tail_sampling_mode).lower()
+        self.tail_hard_ratio = self.hard_ratio if tail_hard_ratio is None else float(min(max(tail_hard_ratio, 0.0), 1.0))
+        self.tail_random_sample_fallback = self.random_sample_fallback if tail_random_sample_fallback is None else bool(tail_random_sample_fallback)
+        self.tail_min_plane_confidence = float(min(max(tail_min_plane_confidence, 0.0), 1.0))
+        self.tail_global_mining_refresh_interval = (
+            self.global_mining_refresh_interval
+            if tail_global_mining_refresh_interval is None
+            else int(max(1, tail_global_mining_refresh_interval))
+        )
+        self.tail_candidate_subset_ratio = float(min(max(tail_candidate_subset_ratio, 0.0), 1.0))
+        self.tail_candidate_subset_min = 0 if tail_candidate_subset_min is None else int(max(0, tail_candidate_subset_min))
+        self.tail_candidate_subset_max = 0 if tail_candidate_subset_max is None else int(max(0, tail_candidate_subset_max))
+        self.tail_stable_sample_ratio_floor = float(min(max(tail_stable_sample_ratio_floor, 0.0), 1.0))
+        self.tail_keep_point_to_plane = bool(tail_keep_point_to_plane)
+        self.tail_point_to_plane_no_fallback = bool(tail_point_to_plane_no_fallback)
+        self.tail_point_to_plane_min_confidence = float(min(max(tail_point_to_plane_min_confidence, 0.0), 1.0))
+        self.tail_point_to_plane_confidence_power = float(max(0.0, tail_point_to_plane_confidence_power))
+        self.tail_point_to_plane_weight_scale = float(max(0.0, tail_point_to_plane_weight_scale))
+        self.tail_keep_orientation = bool(tail_keep_orientation)
+        self.tail_keep_anisotropic_scale = bool(tail_keep_anisotropic_scale)
+        self.tail_keep_normal_scale = bool(tail_keep_normal_scale)
+        self.tail_difficulty_score = str(tail_difficulty_score).lower()
+        self.tail_difficulty_distance_weight = float(max(0.0, tail_difficulty_distance_weight))
+        self.tail_difficulty_orientation_weight = float(max(0.0, tail_difficulty_orientation_weight))
+        self.tail_difficulty_scale_weight = float(max(0.0, tail_difficulty_scale_weight))
+        self.tail_difficulty_normal_weight = float(max(0.0, tail_difficulty_normal_weight))
+        self.tail_difficulty_confidence_weight = float(min(max(tail_difficulty_confidence_weight, 0.0), 1.0))
+        self.difficulty_distance_weight = float(max(0.0, difficulty_distance_weight))
+        self.difficulty_orientation_weight = float(max(0.0, difficulty_orientation_weight))
+        self.difficulty_scale_weight = float(max(0.0, difficulty_scale_weight))
+        self.difficulty_normal_weight = float(max(0.0, difficulty_normal_weight))
+        self.hard_candidate_multiplier = 4
+        self.distance_chunk_size = 1024
         self._cached_support_key = None
         self._cached_quality_score = None
         self._cached_density_score = None
+        self._cached_brightness_score = None
+        self._cached_gradient_score = None
         self._cached_support_score = None
+        self._cached_hard_positions = None
+        self._cached_hard_positions_step = -1
+        self._cached_hard_active_count = -1
+        self._cached_hard_count = -1
+        self._cached_tail_hard_payload = None
+        self._cached_tail_hard_step = -1
+        self._cached_tail_hard_active_count = -1
+        self._cached_tail_hard_count = -1
 
-    def _support_cache_key(self, sparse_points, track_len, reproj_error):
+    def reset_runtime_cache(self):
+        self._cached_hard_positions = None
+        self._cached_hard_positions_step = -1
+        self._cached_hard_active_count = -1
+        self._cached_hard_count = -1
+        self._cached_tail_hard_payload = None
+        self._cached_tail_hard_step = -1
+        self._cached_tail_hard_active_count = -1
+        self._cached_tail_hard_count = -1
+
+    def _support_cache_key(self, sparse_points, track_len, reproj_error, brightness_score, gradient_score):
         return (
             int(sparse_points.data_ptr()),
             int(track_len.data_ptr()) if track_len is not None else -1,
             int(reproj_error.data_ptr()) if reproj_error is not None else -1,
+            int(brightness_score.data_ptr()) if brightness_score is not None else -1,
+            int(gradient_score.data_ptr()) if gradient_score is not None else -1,
             tuple(sparse_points.shape),
         )
 
@@ -416,56 +643,845 @@ class SparsePointRegularizationLoss(BaseLossModule):
             radii.append(local_radius)
         return torch.cat(radii, dim=0)
 
-    def _get_sparse_support_scores(self, sparse_points, track_len, reproj_error):
-        if not self.meta_enabled or track_len is None or reproj_error is None:
-            ones = torch.ones((sparse_points.shape[0],), device=sparse_points.device, dtype=sparse_points.dtype)
-            return ones, ones, ones
-
-        cache_key = self._support_cache_key(sparse_points, track_len, reproj_error)
+    def _get_sparse_support_scores(self, sparse_points, track_len, reproj_error, brightness_score, gradient_score):
+        cache_key = self._support_cache_key(sparse_points, track_len, reproj_error, brightness_score, gradient_score)
         if self._cached_support_key == cache_key:
-            return self._cached_quality_score, self._cached_density_score, self._cached_support_score
+            return (
+                self._cached_quality_score,
+                self._cached_density_score,
+                self._cached_brightness_score,
+                self._cached_gradient_score,
+                self._cached_support_score,
+            )
 
-        track_len = track_len.reshape(-1).to(device=sparse_points.device, dtype=sparse_points.dtype).clamp_min(0.0)
-        reproj_error = reproj_error.reshape(-1).to(device=sparse_points.device, dtype=sparse_points.dtype).clamp_min(0.0)
+        ones = torch.ones((sparse_points.shape[0],), device=sparse_points.device, dtype=sparse_points.dtype)
+        quality_score = ones
+        density_score = ones
 
-        track_score = torch.log1p(track_len)
-        if self.quality_track_mode == "log_median_norm":
-            positive_track = track_score[track_score > 0.0]
-            track_median = positive_track.median() if positive_track.numel() > 0 else torch.tensor(1.0, device=track_score.device, dtype=track_score.dtype)
-            track_score = track_score / track_median.clamp_min(self.knn_eps)
+        if self.meta_enabled and track_len is not None and reproj_error is not None:
+            track_len = track_len.reshape(-1).to(device=sparse_points.device, dtype=sparse_points.dtype).clamp_min(0.0)
+            reproj_error = reproj_error.reshape(-1).to(device=sparse_points.device, dtype=sparse_points.dtype).clamp_min(0.0)
 
-        if self.quality_error_scale_mode == "median":
-            positive_error = reproj_error[reproj_error > 0.0]
-            if positive_error.numel() > 0:
-                error_scale = positive_error.median()
+            track_score = torch.log1p(track_len)
+            if self.quality_track_mode == "log_median_norm":
+                positive_track = track_score[track_score > 0.0]
+                track_median = positive_track.median() if positive_track.numel() > 0 else torch.tensor(1.0, device=track_score.device, dtype=track_score.dtype)
+                track_score = track_score / track_median.clamp_min(self.knn_eps)
+
+            if self.quality_error_scale_mode == "median":
+                positive_error = reproj_error[reproj_error > 0.0]
+                if positive_error.numel() > 0:
+                    error_scale = positive_error.median()
+                else:
+                    error_scale = torch.tensor(1.0, device=reproj_error.device, dtype=reproj_error.dtype)
             else:
-                error_scale = torch.tensor(1.0, device=reproj_error.device, dtype=reproj_error.dtype)
+                error_scale = reproj_error.mean() if reproj_error.numel() > 0 else torch.tensor(1.0, device=reproj_error.device, dtype=reproj_error.dtype)
+            error_score = torch.exp(-reproj_error / error_scale.clamp_min(self.knn_eps))
+            quality_score = (track_score * error_score).clamp_min(self.knn_eps)
+
+            density_radius = self._compute_density_radius(sparse_points)
+            positive_radius = density_radius[density_radius > 0.0]
+            radius_median = positive_radius.median() if positive_radius.numel() > 0 else torch.tensor(1.0, device=density_radius.device, dtype=density_radius.dtype)
+            density_score = (radius_median / density_radius.clamp_min(self.knn_eps)).clamp(self.density_clamp_min, self.density_clamp_max)
+
+        if self.lowlight_brightness_enabled and brightness_score is not None:
+            brightness_score = brightness_score.reshape(-1).to(device=sparse_points.device, dtype=sparse_points.dtype).clamp_min(self.knn_eps)
         else:
-            error_scale = reproj_error.mean() if reproj_error.numel() > 0 else torch.tensor(1.0, device=reproj_error.device, dtype=reproj_error.dtype)
-        error_score = torch.exp(-reproj_error / error_scale.clamp_min(self.knn_eps))
-        quality_score = (track_score * error_score).clamp_min(self.knn_eps)
+            brightness_score = ones
+        if self.lowlight_gradient_enabled and gradient_score is not None:
+            gradient_score = gradient_score.reshape(-1).to(device=sparse_points.device, dtype=sparse_points.dtype).clamp_min(self.knn_eps)
+        else:
+            gradient_score = ones
 
-        density_radius = self._compute_density_radius(sparse_points)
-        positive_radius = density_radius[density_radius > 0.0]
-        radius_median = positive_radius.median() if positive_radius.numel() > 0 else torch.tensor(1.0, device=density_radius.device, dtype=density_radius.dtype)
-        density_score = (radius_median / density_radius.clamp_min(self.knn_eps)).clamp(self.density_clamp_min, self.density_clamp_max)
-
-        support_score = quality_score * density_score
+        support_score = quality_score * density_score * brightness_score * gradient_score
         self._cached_support_key = cache_key
         self._cached_quality_score = quality_score
         self._cached_density_score = density_score
+        self._cached_brightness_score = brightness_score
+        self._cached_gradient_score = gradient_score
         self._cached_support_score = support_score
-        return quality_score, density_score, support_score
+        return quality_score, density_score, brightness_score, gradient_score, support_score
+
+    def _sparse_weight_scale(self, context):
+        if self.weight_schedule == "constant":
+            return 1.0
+        if self.weight_schedule == "plateau_decay":
+            step = int(context.get("step", 0))
+            decay_end_step = self.weight_decay_end_step
+            hold_end_step = self.tail_start_step if self.tail_weight_hold_end_step is None else self.tail_weight_hold_end_step
+            if decay_end_step is None or decay_end_step <= hold_end_step:
+                return self.weight_end_scale
+            if step <= hold_end_step:
+                return self.weight_start_scale
+            progress = (step - hold_end_step) / float(decay_end_step - hold_end_step)
+            progress = min(max(progress, 0.0), 1.0)
+            return self.weight_start_scale + (self.weight_end_scale - self.weight_start_scale) * progress
+        if self.weight_schedule != "decay":
+            raise RuntimeError(f"Unsupported sparse weight schedule: {self.weight_schedule}")
+
+        step = int(context.get("step", 0))
+        decay_end_step = self.weight_decay_end_step
+        if decay_end_step is None or decay_end_step <= self.start_step:
+            return self.weight_end_scale
+        if step <= self.start_step:
+            return self.weight_start_scale
+
+        progress = (step - self.start_step) / float(decay_end_step - self.start_step)
+        progress = min(max(progress, 0.0), 1.0)
+        return self.weight_start_scale + (self.weight_end_scale - self.weight_start_scale) * progress
+
+    def current_weight(self, context):
+        return super().current_weight(context) * self._sparse_weight_scale(context)
+
+    def _is_tail_phase(self, context):
+        if not self.tail_light_mode_enabled:
+            return False
+        return int(context.get("step", 0)) > self.tail_start_step
+
+    def _effective_sampling_mode(self, context):
+        if self._is_tail_phase(context):
+            return self.tail_sampling_mode
+        return self.sampling_mode
+
+    def _effective_difficulty_mode(self, context, sampling_mode=None):
+        sampling_mode = self._effective_sampling_mode(context) if sampling_mode is None else str(sampling_mode).lower()
+        if self._is_tail_phase(context) and sampling_mode == "stable_surface_mixed":
+            return self.tail_difficulty_score
+        return self.difficulty_score
+
+    def _tail_confidence_term(self, plane_confidence):
+        blended = 0.5 + 0.5 * plane_confidence
+        return (1.0 - self.tail_difficulty_confidence_weight) + self.tail_difficulty_confidence_weight * blended
+
+    def _update_topk(self, top_scores, top_positions, new_scores, new_positions, k):
+        if k <= 0 or new_scores.numel() == 0:
+            return top_scores, top_positions
+        if top_scores is None or top_positions is None:
+            keep = min(k, int(new_scores.numel()))
+            keep_pos = torch.topk(new_scores, k=keep, largest=True).indices
+            return new_scores[keep_pos], new_positions[keep_pos]
+        combined_scores = torch.cat([top_scores, new_scores], dim=0)
+        combined_positions = torch.cat([top_positions, new_positions], dim=0)
+        keep = min(k, int(combined_scores.numel()))
+        keep_pos = torch.topk(combined_scores, k=keep, largest=True).indices
+        return combined_scores[keep_pos], combined_positions[keep_pos]
+
+    def _tail_candidate_target_count(self, active_count, hard_count):
+        if active_count <= 0:
+            return 0
+        required_count = min(active_count, max(1, int(hard_count)))
+        ratio_target = int(math.ceil(float(active_count) * self.tail_candidate_subset_ratio))
+        candidate_target = max(required_count, hard_count * self.hard_candidate_multiplier, ratio_target)
+        if self.tail_candidate_subset_min > 0:
+            candidate_target = max(candidate_target, self.tail_candidate_subset_min)
+        if self.tail_candidate_subset_max > 0:
+            candidate_target = min(candidate_target, self.tail_candidate_subset_max)
+        return min(active_count, max(required_count, candidate_target))
+
+    def _sample_tail_candidate_positions(self, active_count, candidate_count, device):
+        if candidate_count >= active_count:
+            return torch.arange(active_count, device=device, dtype=torch.long)
+        return torch.randperm(active_count, device=device)[:candidate_count]
+
+    def _compute_min_sparse_distance(self, query_points, sparse_points):
+        if query_points.numel() == 0:
+            return torch.zeros((0,), device=sparse_points.device, dtype=sparse_points.dtype)
+        min_distances = []
+        for start in range(0, int(query_points.shape[0]), self.distance_chunk_size):
+            end = min(start + self.distance_chunk_size, int(query_points.shape[0]))
+            chunk = query_points[start:end]
+            chunk_min = torch.cdist(chunk, sparse_points).min(dim=1).values
+            min_distances.append(chunk_min)
+        return torch.cat(min_distances, dim=0)
+
+    def _build_support_neighborhood(self, query_points, sparse_points, support_score):
+        if query_points.numel() == 0:
+            zero = torch.zeros((0, 1), device=sparse_points.device, dtype=sparse_points.dtype)
+            return {
+                "knn_dist": zero,
+                "knn_idx": torch.zeros((0, 1), device=sparse_points.device, dtype=torch.long),
+                "knn_points": torch.zeros((0, 1, 3), device=sparse_points.device, dtype=sparse_points.dtype),
+                "knn_weights": zero,
+                "barycenter": torch.zeros((0, 3), device=sparse_points.device, dtype=sparse_points.dtype),
+                "neighbor_k": 1,
+            }
+
+        neighbor_k = min(max(self.knn_k, self.plane_k), int(sparse_points.shape[0]))
+        distances = torch.cdist(query_points, sparse_points)
+        knn_dist, knn_idx = torch.topk(distances, k=neighbor_k, dim=1, largest=False)
+        knn_points = sparse_points[knn_idx]
+        knn_support = support_score[knn_idx]
+        knn_weights = knn_support / knn_dist.clamp_min(self.knn_eps)
+        knn_weights = knn_weights / knn_weights.sum(dim=1, keepdim=True).clamp_min(self.knn_eps)
+        barycenter = (knn_points * knn_weights.unsqueeze(-1)).sum(dim=1)
+        return {
+            "knn_dist": knn_dist,
+            "knn_idx": knn_idx,
+            "knn_points": knn_points,
+            "knn_weights": knn_weights,
+            "barycenter": barycenter,
+            "neighbor_k": neighbor_k,
+        }
+
+    def _charbonnier_penalty(self, values):
+        eps = values.new_tensor(self.knn_eps)
+        return torch.sqrt(values.square() + eps) - torch.sqrt(eps)
+
+    def _extract_surface_aligned_scales(self, gaussian_scales, rotation, normal):
+        scale_values = torch.exp(gaussian_scales)
+        if rotation is None:
+            gaussian_normal_scale = scale_values[:, 2]
+            gaussian_tangent_scale = scale_values[:, :2].mean(dim=1)
+            return scale_values, gaussian_tangent_scale, gaussian_normal_scale, None
+
+        axis_alignment = torch.abs(torch.einsum("bij,bj->bi", rotation.transpose(1, 2), normal))
+        normal_axis = axis_alignment.argmax(dim=1, keepdim=True)
+        gaussian_normal_scale = torch.gather(scale_values, 1, normal_axis).squeeze(1)
+        gaussian_tangent_scale = (scale_values.sum(dim=1) - gaussian_normal_scale) * 0.5
+        return scale_values, gaussian_tangent_scale, gaussian_normal_scale, axis_alignment
+
+    def _row_quantile(self, values, q):
+        if values.ndim != 2:
+            raise RuntimeError(f"Expected [B,N] tensor for row quantile, got {tuple(values.shape)}")
+        if values.shape[1] == 0:
+            return torch.zeros((int(values.shape[0]),), device=values.device, dtype=values.dtype)
+        if values.shape[1] == 1:
+            return values[:, 0]
+        q = float(min(max(q, 0.0), 1.0))
+        sorted_values, _ = torch.sort(values, dim=1)
+        quantile_index = int(round(q * float(values.shape[1] - 1)))
+        return sorted_values[:, quantile_index]
+
+    def _build_scale_targets(self, neighborhood, normal, eigvals, eigvecs):
+        knn_points = neighborhood["knn_points"]
+        neighbor_k = int(knn_points.shape[1])
+        if neighbor_k > 1:
+            anchor_points = knn_points[:, :1, :]
+            anchor_offsets = knn_points[:, 1:] - anchor_points
+            normal_view = normal.unsqueeze(1)
+            signed_normal_offsets = torch.sum(anchor_offsets * normal_view, dim=2)
+            tangent_basis = eigvecs[:, :, 1:3]
+            tangent_axis_offsets = torch.abs(torch.einsum("bnd,bdk->bnk", anchor_offsets, tangent_basis))
+            anchor_radius = torch.norm(anchor_offsets, dim=2)
+            local_radius = anchor_radius.mean(dim=1)
+            tangent_extent = 0.5 * (
+                self._row_quantile(tangent_axis_offsets[:, :, 0], self.target_tangent_quantile)
+                + self._row_quantile(tangent_axis_offsets[:, :, 1], self.target_tangent_quantile)
+            )
+            normal_extent = self._row_quantile(signed_normal_offsets.abs(), self.target_normal_quantile)
+            tangent_std = 0.5 * (
+                torch.sqrt(eigvals[:, 1].clamp_min(self.knn_eps))
+                + torch.sqrt(eigvals[:, 2].clamp_min(self.knn_eps))
+            )
+            normal_std = torch.sqrt(eigvals[:, 0].clamp_min(self.knn_eps))
+            tangent_extent = torch.minimum(tangent_extent, tangent_std * self.target_tangent_std_cap_ratio)
+            tangent_extent = self.target_tangent_std_blend * tangent_std + (1.0 - self.target_tangent_std_blend) * tangent_extent
+            tangent_extent = torch.maximum(tangent_extent, tangent_std * self.target_tangent_std_floor_ratio)
+            normal_extent = torch.maximum(normal_extent, normal_std)
+        else:
+            local_radius = neighborhood["knn_dist"][:, 0]
+            tangent_extent = local_radius
+            normal_extent = local_radius
+        tangent_scale_cap = torch.minimum(
+            torch.full_like(local_radius, self.target_tangent_scale_max),
+            local_radius * self.target_tangent_local_radius_cap_ratio,
+        )
+        tangent_scale_cap = torch.maximum(tangent_scale_cap, torch.full_like(local_radius, self.target_tangent_scale_min))
+        target_tangent_scale = torch.clamp(
+            tangent_extent * self.tangent_scale_ratio,
+            min=self.target_tangent_scale_min,
+        )
+        target_tangent_scale = torch.minimum(target_tangent_scale, tangent_scale_cap)
+        target_normal_scale = torch.clamp(
+            normal_extent * self.normal_scale_ratio,
+            min=self.target_normal_scale_min,
+            max=self.target_normal_scale_max,
+        )
+        return local_radius, target_tangent_scale, target_normal_scale, tangent_scale_cap
+
+    def _compute_residual_bundle(self, query_points, neighborhood, gaussian_quats=None, gaussian_scales=None, tail_phase_active=False):
+        barycenter = neighborhood["barycenter"]
+        barycenter_residual = torch.norm(query_points - barycenter, dim=1)
+        zero = torch.zeros_like(barycenter_residual)
+
+        if self.mode != "point_to_plane" or neighborhood["neighbor_k"] < 3:
+            return {
+                "residual": barycenter_residual,
+                "barycenter_residual": barycenter_residual,
+                "plane_residual": barycenter_residual,
+                "normal_residual": zero,
+                "tangent_residual": zero,
+                "normal_scale_penalty": zero,
+                "orientation_alignment": zero,
+                "orientation_loss": zero,
+                "anisotropic_scale_target": zero,
+                "anisotropic_scale_target_loss": zero,
+                "normal_scale_loss": zero,
+                "local_radius": zero,
+                "target_tangent_scale": zero,
+                "target_normal_scale": zero,
+                "target_tangent_scale_cap": zero,
+                "gaussian_tangent_scale": zero,
+                "gaussian_normal_scale": zero,
+                "monitor_residual": barycenter_residual,
+                "plane_confidence": zero,
+                "orientation_alignment_raw": zero,
+                "anisotropic_scale_target_raw": zero,
+                "stable_mask": torch.zeros_like(barycenter_residual, dtype=torch.bool),
+                "fallback_mask": torch.ones_like(barycenter_residual, dtype=torch.bool),
+            }
+
+        knn_points = neighborhood["knn_points"]
+        knn_weights = neighborhood["knn_weights"]
+        centered = knn_points - barycenter.unsqueeze(1)
+        cov = torch.matmul((knn_weights.unsqueeze(-1) * centered).transpose(1, 2), centered)
+        cov = cov + self.plane_eps * torch.eye(3, device=cov.device, dtype=cov.dtype).unsqueeze(0)
+        eigvals, eigvecs = torch.linalg.eigh(cov)
+        normal = F.normalize(eigvecs[:, :, 0], dim=-1, eps=self.knn_eps)
+        eigen_gap = eigvals[:, 1] - eigvals[:, 0]
+        stable_mask = torch.isfinite(eigen_gap) & torch.isfinite(normal).all(dim=1) & (eigen_gap >= self.plane_min_eigen_gap)
+        plane_confidence = eigen_gap / (eigen_gap + self.plane_min_eigen_gap + self.knn_eps)
+        plane_confidence = torch.where(torch.isfinite(plane_confidence), plane_confidence.clamp(0.0, 1.0), zero)
+
+        delta = query_points - barycenter
+        signed_normal = torch.sum(delta * normal, dim=1)
+        normal_residual = signed_normal.abs()
+        tangent_vec = delta - signed_normal.unsqueeze(-1) * normal
+        tangent_residual = torch.norm(tangent_vec, dim=1)
+        geometry_residual = normal_residual + self.tangent_weight * tangent_residual
+        plane_residual = geometry_residual
+        tail_point_to_plane_residual = torch.where(stable_mask, geometry_residual, zero)
+        local_radius, target_tangent_scale, target_normal_scale, target_tangent_scale_cap = self._build_scale_targets(neighborhood, normal, eigvals, eigvecs)
+        tail_confidence_mask = stable_mask
+        if self.tail_point_to_plane_no_fallback:
+            tail_confidence_mask = tail_confidence_mask & (plane_confidence >= self.tail_point_to_plane_min_confidence)
+        tail_confidence_weight = torch.where(
+            tail_confidence_mask,
+            plane_confidence.clamp_min(self.knn_eps).pow(self.tail_point_to_plane_confidence_power),
+            zero,
+        )
+
+        rotation = None
+        if gaussian_quats is not None:
+            rotation = _quaternion_to_rotation_matrix(gaussian_quats)
+
+        orientation_alignment = zero
+        orientation_alignment_raw = zero
+        orientation_loss = zero
+        if rotation is not None and self.orientation_enabled and self.orientation_weight > 0.0:
+            gaussian_normal_axis = F.normalize(rotation[:, :, 2], dim=-1, eps=self.knn_eps)
+            orientation_alignment_raw = 1.0 - torch.abs(torch.sum(gaussian_normal_axis * normal, dim=1)).clamp(0.0, 1.0)
+            orientation_alignment = orientation_alignment_raw
+            orientation_alignment = torch.where(stable_mask, orientation_alignment, zero)
+            orientation_loss = self.orientation_weight * orientation_alignment
+            plane_residual = plane_residual + orientation_loss
+
+        gaussian_tangent_scale = zero
+        gaussian_normal_scale = zero
+        anisotropic_scale_target = zero
+        anisotropic_scale_target_raw = zero
+        anisotropic_scale_target_loss = zero
+        normal_scale_loss = zero
+        if gaussian_scales is not None:
+            _, gaussian_tangent_scale, gaussian_normal_scale, _ = self._extract_surface_aligned_scales(
+                gaussian_scales,
+                rotation,
+                normal,
+            )
+            if self.anisotropic_scale_target_enabled and self.anisotropic_scale_target_weight > 0.0:
+                tangent_delta = gaussian_tangent_scale - target_tangent_scale
+                normal_delta = gaussian_normal_scale - target_normal_scale
+                anisotropic_scale_target_raw = 0.5 * (
+                    self._charbonnier_penalty(tangent_delta) + self._charbonnier_penalty(normal_delta)
+                )
+                anisotropic_scale_target = anisotropic_scale_target_raw
+                anisotropic_scale_target = torch.where(stable_mask, anisotropic_scale_target, zero)
+                anisotropic_scale_target_loss = self.anisotropic_scale_target_weight * anisotropic_scale_target
+                plane_residual = plane_residual + anisotropic_scale_target_loss
+
+        normal_scale_penalty = zero
+        if gaussian_quats is not None and gaussian_scales is not None and self.normal_scale_weight > 0.0:
+            if rotation is None:
+                rotation = _quaternion_to_rotation_matrix(gaussian_quats)
+            _, tangent_scale, normal_scale, _ = self._extract_surface_aligned_scales(
+                gaussian_scales,
+                rotation,
+                normal,
+            )
+            normal_scale_penalty = F.relu(normal_scale - tangent_scale)
+            normal_scale_penalty = torch.where(stable_mask, normal_scale_penalty, zero)
+            normal_scale_loss = self.normal_scale_weight * normal_scale_penalty
+            plane_residual = plane_residual + normal_scale_loss
+
+        monitor_residual = torch.where(stable_mask, geometry_residual, barycenter_residual)
+        tail_point_to_plane_active = False
+        if tail_phase_active:
+            tail_residual = zero
+            if self.tail_keep_point_to_plane and self.tail_point_to_plane_weight_scale > 0.0:
+                tail_residual = tail_residual + self.tail_point_to_plane_weight_scale * tail_point_to_plane_residual * tail_confidence_weight
+                tail_point_to_plane_active = bool(tail_confidence_mask.any().item())
+            if self.tail_keep_orientation:
+                tail_residual = tail_residual + orientation_loss * tail_confidence_weight
+            if self.tail_keep_anisotropic_scale:
+                tail_residual = tail_residual + anisotropic_scale_target_loss * tail_confidence_weight
+            if self.tail_keep_normal_scale:
+                tail_residual = tail_residual + normal_scale_loss * tail_confidence_weight
+            residual = torch.where(tail_confidence_mask, tail_residual, zero)
+        else:
+            residual = torch.where(stable_mask, plane_residual, barycenter_residual)
+        return {
+            "residual": residual,
+            "barycenter_residual": barycenter_residual,
+            "monitor_residual": monitor_residual,
+            "plane_residual": plane_residual,
+            "normal_residual": normal_residual,
+            "tangent_residual": tangent_residual,
+            "normal_scale_penalty": normal_scale_penalty,
+            "normal_scale_loss": normal_scale_loss,
+            "orientation_alignment": orientation_alignment,
+            "orientation_alignment_raw": orientation_alignment_raw,
+            "orientation_loss": orientation_loss,
+            "anisotropic_scale_target": anisotropic_scale_target,
+            "anisotropic_scale_target_raw": anisotropic_scale_target_raw,
+            "anisotropic_scale_target_loss": anisotropic_scale_target_loss,
+            "local_radius": local_radius,
+            "target_tangent_scale": target_tangent_scale,
+            "target_normal_scale": target_normal_scale,
+            "target_tangent_scale_cap": target_tangent_scale_cap,
+            "gaussian_tangent_scale": gaussian_tangent_scale,
+            "gaussian_normal_scale": gaussian_normal_scale,
+            "plane_confidence": plane_confidence,
+            "tail_point_to_plane_active": tail_point_to_plane_active,
+            "tail_confidence_mask": tail_confidence_mask,
+            "stable_mask": stable_mask,
+            "fallback_mask": ~stable_mask,
+        }
+
+    def _global_mining_difficulty_mode(self):
+        if self.difficulty_score == "vsurface_mixed":
+            return "min_sparse_dist"
+        return self.difficulty_score
+
+    def _compute_difficulty_scores(
+        self,
+        query_points,
+        sparse_points,
+        support_score,
+        gaussian_quats=None,
+        gaussian_scales=None,
+        difficulty_mode=None,
+        residual_bundle=None,
+        min_sparse_distance=None,
+    ):
+        difficulty_mode = self.difficulty_score if difficulty_mode is None else str(difficulty_mode).lower()
+        if difficulty_mode == "min_sparse_dist":
+            if min_sparse_distance is None:
+                min_sparse_distance = self._compute_min_sparse_distance(query_points, sparse_points)
+            return min_sparse_distance
+        if difficulty_mode == "plane_residual":
+            if residual_bundle is None:
+                neighborhood = self._build_support_neighborhood(query_points, sparse_points, support_score)
+                residual_bundle = self._compute_residual_bundle(query_points, neighborhood, gaussian_quats, gaussian_scales, tail_phase_active=False)
+            return residual_bundle["plane_residual"]
+        if difficulty_mode == "vsurface_mixed":
+            if residual_bundle is None:
+                neighborhood = self._build_support_neighborhood(query_points, sparse_points, support_score)
+                residual_bundle = self._compute_residual_bundle(query_points, neighborhood, gaussian_quats, gaussian_scales, tail_phase_active=False)
+            local_radius = residual_bundle["local_radius"].clamp_min(self.knn_eps)
+            if min_sparse_distance is None:
+                min_sparse_distance = self._compute_min_sparse_distance(query_points, sparse_points)
+            normalized_distance = (min_sparse_distance / local_radius).clamp(0.0, 4.0)
+            normalized_normal = (residual_bundle["normal_residual"] / local_radius).clamp(0.0, 4.0)
+            return (
+                self.difficulty_distance_weight * normalized_distance
+                + self.difficulty_orientation_weight * residual_bundle["orientation_alignment_raw"]
+                + self.difficulty_scale_weight * residual_bundle["anisotropic_scale_target_raw"]
+                + self.difficulty_normal_weight * normalized_normal
+            )
+        if difficulty_mode == "stable_surface_mixed":
+            if residual_bundle is None:
+                neighborhood = self._build_support_neighborhood(query_points, sparse_points, support_score)
+                residual_bundle = self._compute_residual_bundle(query_points, neighborhood, gaussian_quats, gaussian_scales, tail_phase_active=False)
+            local_radius = residual_bundle["local_radius"].clamp_min(self.knn_eps)
+            if min_sparse_distance is None:
+                min_sparse_distance = self._compute_min_sparse_distance(query_points, sparse_points)
+            normalized_distance = (min_sparse_distance / local_radius).clamp(0.0, 4.0)
+            normalized_normal = (residual_bundle["normal_residual"] / local_radius).clamp(0.0, 4.0)
+            base_score = (
+                self.tail_difficulty_distance_weight * normalized_distance
+                + self.tail_difficulty_orientation_weight * residual_bundle["orientation_alignment_raw"]
+                + self.tail_difficulty_scale_weight * residual_bundle["anisotropic_scale_target_raw"]
+                + self.tail_difficulty_normal_weight * normalized_normal
+            )
+            confidence_term = self._tail_confidence_term(residual_bundle["plane_confidence"])
+            stable_gate = residual_bundle["stable_mask"].to(base_score.dtype)
+            return base_score * confidence_term * stable_gate
+        raise RuntimeError(f"Unsupported sparse difficulty score: {difficulty_mode}")
+
+    def _mine_global_hard_positions(self, means, active_indices, sparse_points, support_score, context, hard_count, quats=None, scales=None):
+        step = int(context.get("step", 0))
+        if (
+            self._cached_hard_positions is not None
+            and self._cached_hard_positions_step >= 0
+            and step - self._cached_hard_positions_step < self.global_mining_refresh_interval
+            and self._cached_hard_active_count == int(active_indices.numel())
+            and self._cached_hard_count == int(hard_count)
+        ):
+            return self._cached_hard_positions
+
+        top_scores = None
+        top_positions = None
+        active_count = int(active_indices.numel())
+        for start in range(0, active_count, self.global_mining_chunk_size):
+            end = min(start + self.global_mining_chunk_size, active_count)
+            chunk_positions = torch.arange(start, end, device=active_indices.device, dtype=torch.long)
+            chunk_indices = active_indices[start:end]
+            with torch.no_grad():
+                chunk_quats = None if quats is None else quats[chunk_indices].detach()
+                chunk_scales = None if scales is None else scales[chunk_indices].detach()
+                chunk_scores = self._compute_difficulty_scores(
+                    means[chunk_indices].detach(),
+                    sparse_points,
+                    support_score,
+                    chunk_quats,
+                    chunk_scales,
+                    difficulty_mode=self._global_mining_difficulty_mode(),
+                )
+
+            if top_scores is None:
+                keep = min(hard_count, int(chunk_scores.numel()))
+                keep_pos = torch.topk(chunk_scores, k=keep, largest=True).indices
+                top_scores = chunk_scores[keep_pos]
+                top_positions = chunk_positions[keep_pos]
+                continue
+
+            combined_scores = torch.cat([top_scores, chunk_scores], dim=0)
+            combined_positions = torch.cat([top_positions, chunk_positions], dim=0)
+            keep = min(hard_count, int(combined_scores.numel()))
+            keep_pos = torch.topk(combined_scores, k=keep, largest=True).indices
+            top_scores = combined_scores[keep_pos]
+            top_positions = combined_positions[keep_pos]
+
+        if top_positions is None:
+            top_positions = torch.zeros((0,), device=active_indices.device, dtype=torch.long)
+        self._cached_hard_positions = top_positions
+        self._cached_hard_positions_step = step
+        self._cached_hard_active_count = active_count
+        self._cached_hard_count = int(hard_count)
+        return top_positions
+
+    def _mine_tail_hard_payload(self, means, active_indices, sparse_points, support_score, context, hard_count, quats=None, scales=None):
+        step = int(context.get("step", 0))
+        if (
+            self._cached_tail_hard_payload is not None
+            and self._cached_tail_hard_step >= 0
+            and step - self._cached_tail_hard_step < self.tail_global_mining_refresh_interval
+            and self._cached_tail_hard_active_count == int(active_indices.numel())
+            and self._cached_tail_hard_count == int(hard_count)
+        ):
+            return self._cached_tail_hard_payload
+
+        top_high_scores = None
+        top_high_positions = None
+        top_stable_scores = None
+        top_stable_positions = None
+        high_conf_count = 0
+        stable_count = 0
+        active_count = int(active_indices.numel())
+        candidate_count = self._tail_candidate_target_count(active_count, hard_count)
+        candidate_positions = self._sample_tail_candidate_positions(active_count, candidate_count, active_indices.device)
+        for start in range(0, candidate_count, self.global_mining_chunk_size):
+            end = min(start + self.global_mining_chunk_size, candidate_count)
+            chunk_positions = candidate_positions[start:end]
+            chunk_indices = active_indices[chunk_positions]
+            with torch.no_grad():
+                chunk_means = means[chunk_indices].detach()
+                chunk_quats = None if quats is None else quats[chunk_indices].detach()
+                chunk_scales = None if scales is None else scales[chunk_indices].detach()
+                neighborhood = self._build_support_neighborhood(chunk_means, sparse_points, support_score)
+                residual_bundle = self._compute_residual_bundle(chunk_means, neighborhood, chunk_quats, chunk_scales, tail_phase_active=False)
+                chunk_min_sparse_distance = self._compute_min_sparse_distance(chunk_means, sparse_points)
+                chunk_scores = self._compute_difficulty_scores(
+                    chunk_means,
+                    sparse_points,
+                    support_score,
+                    chunk_quats,
+                    chunk_scales,
+                    difficulty_mode=self.tail_difficulty_score,
+                    residual_bundle=residual_bundle,
+                    min_sparse_distance=chunk_min_sparse_distance,
+                )
+                stable_mask = residual_bundle["stable_mask"]
+                high_conf_mask = stable_mask & (residual_bundle["plane_confidence"] >= self.tail_min_plane_confidence)
+                stable_only_mask = stable_mask & ~high_conf_mask
+                high_conf_count += int(high_conf_mask.sum().item())
+                stable_count += int(stable_mask.sum().item())
+                top_high_scores, top_high_positions = self._update_topk(
+                    top_high_scores,
+                    top_high_positions,
+                    chunk_scores[high_conf_mask],
+                    chunk_positions[high_conf_mask],
+                    hard_count,
+                )
+                top_stable_scores, top_stable_positions = self._update_topk(
+                    top_stable_scores,
+                    top_stable_positions,
+                    chunk_scores[stable_only_mask],
+                    chunk_positions[stable_only_mask],
+                    hard_count,
+                )
+
+        if top_high_positions is None:
+            top_high_positions = torch.zeros((0,), device=active_indices.device, dtype=torch.long)
+        if top_stable_positions is None:
+            top_stable_positions = torch.zeros((0,), device=active_indices.device, dtype=torch.long)
+        payload = {
+            "high_conf_positions": top_high_positions,
+            "stable_positions": top_stable_positions,
+            "high_conf_candidate_ratio": float(high_conf_count / max(1, candidate_count)),
+            "stable_candidate_ratio": float(stable_count / max(1, candidate_count)),
+            "scan_candidate_ratio": float(candidate_count / max(1, active_count)),
+            "candidate_count": float(candidate_count),
+        }
+        self._cached_tail_hard_payload = payload
+        self._cached_tail_hard_step = step
+        self._cached_tail_hard_active_count = active_count
+        self._cached_tail_hard_count = int(hard_count)
+        return payload
+
+    def _sample_active_indices(self, means, active_indices, sparse_points, support_score, context, quats=None, scales=None):
+        active_count = int(active_indices.numel())
+        effective_sampling_mode = self._effective_sampling_mode(context)
+        effective_difficulty_mode = self._effective_difficulty_mode(context, effective_sampling_mode)
+        effective_hard_ratio = self.tail_hard_ratio if effective_sampling_mode == "stable_surface_mixed" else self.hard_ratio
+        effective_random_sample_fallback = self.tail_random_sample_fallback if effective_sampling_mode == "stable_surface_mixed" else self.random_sample_fallback
+        if active_count <= self.sample_points:
+            return active_indices, {
+                "hard_sample_count": 0.0,
+                "random_sample_count": float(active_count),
+                "candidate_count": float(active_count),
+                "sampling_mode": effective_sampling_mode,
+                "difficulty_score_mode": effective_difficulty_mode,
+                "hard_ratio": float(effective_hard_ratio),
+                "tail_stable_candidate_ratio": 0.0,
+                "tail_high_conf_candidate_ratio": 0.0,
+                "tail_sample_high_conf_ratio": 0.0,
+                "tail_scan_candidate_ratio": 0.0,
+            }
+
+        if effective_sampling_mode == "random":
+            perm = torch.randperm(active_count, device=active_indices.device)[:self.sample_points]
+            return active_indices[perm], {
+                "hard_sample_count": 0.0,
+                "random_sample_count": float(self.sample_points),
+                "candidate_count": float(self.sample_points),
+                "sampling_mode": effective_sampling_mode,
+                "difficulty_score_mode": effective_difficulty_mode,
+                "hard_ratio": float(effective_hard_ratio),
+                "tail_stable_candidate_ratio": 0.0,
+                "tail_high_conf_candidate_ratio": 0.0,
+                "tail_sample_high_conf_ratio": 0.0,
+                "tail_scan_candidate_ratio": 0.0,
+            }
+
+        if effective_sampling_mode == "stable_surface_mixed":
+            hard_count = int(round(self.sample_points * effective_hard_ratio))
+            hard_count = min(max(0, hard_count), self.sample_points, active_count)
+            if hard_count <= 0:
+                perm = torch.randperm(active_count, device=active_indices.device)[:self.sample_points]
+                return active_indices[perm], {
+                    "hard_sample_count": 0.0,
+                    "random_sample_count": float(self.sample_points),
+                    "candidate_count": float(self.sample_points),
+                    "sampling_mode": effective_sampling_mode,
+                    "difficulty_score_mode": effective_difficulty_mode,
+                    "hard_ratio": float(effective_hard_ratio),
+                    "tail_stable_candidate_ratio": 0.0,
+                    "tail_high_conf_candidate_ratio": 0.0,
+                    "tail_sample_high_conf_ratio": 0.0,
+                    "tail_scan_candidate_ratio": 0.0,
+                }
+
+            stable_target = min(self.sample_points, max(hard_count, int(round(self.sample_points * self.tail_stable_sample_ratio_floor))))
+            tail_payload = self._mine_tail_hard_payload(
+                means,
+                active_indices,
+                sparse_points,
+                support_score,
+                context,
+                stable_target,
+                quats,
+                scales,
+            )
+            selected_high_positions = tail_payload["high_conf_positions"][: min(stable_target, int(tail_payload["high_conf_positions"].numel()))]
+            remaining_stable = max(0, stable_target - int(selected_high_positions.numel()))
+            selected_stable_positions = tail_payload["stable_positions"][: min(remaining_stable, int(tail_payload["stable_positions"].numel()))]
+            hard_positions = torch.cat([selected_high_positions, selected_stable_positions], dim=0)
+            hard_indices = active_indices[hard_positions]
+            random_count = self.sample_points - int(hard_indices.numel())
+            if random_count > 0 and effective_random_sample_fallback:
+                remaining_mask = torch.ones((active_count,), dtype=torch.bool, device=active_indices.device)
+                remaining_mask[hard_positions] = False
+                remaining_indices = active_indices[remaining_mask]
+                random_count = min(random_count, int(remaining_indices.numel()))
+                random_perm = torch.randperm(int(remaining_indices.numel()), device=active_indices.device)[:random_count]
+                random_indices = remaining_indices[random_perm]
+                sampled_indices = torch.cat([hard_indices, random_indices], dim=0)
+            else:
+                random_count = 0
+                sampled_indices = hard_indices
+            shuffle_perm = torch.randperm(int(sampled_indices.numel()), device=active_indices.device)
+            sampled_indices = sampled_indices[shuffle_perm]
+            return sampled_indices, {
+                "hard_sample_count": float(int(hard_indices.numel())),
+                "random_sample_count": float(random_count),
+                "candidate_count": float(tail_payload["candidate_count"]),
+                "sampling_mode": effective_sampling_mode,
+                "difficulty_score_mode": effective_difficulty_mode,
+                "hard_ratio": float(effective_hard_ratio),
+                "tail_stable_candidate_ratio": float(tail_payload["stable_candidate_ratio"]),
+                "tail_high_conf_candidate_ratio": float(tail_payload["high_conf_candidate_ratio"]),
+                "tail_sample_high_conf_ratio": float(int(selected_high_positions.numel()) / max(1, int(sampled_indices.numel()))),
+                "tail_scan_candidate_ratio": float(tail_payload.get("scan_candidate_ratio", 1.0)),
+            }
+
+        if effective_sampling_mode not in {"hardest_mixed", "hardest_global_mixed"}:
+            raise RuntimeError(f"Unsupported sparse sampling mode: {effective_sampling_mode}")
+
+        hard_count = int(round(self.sample_points * effective_hard_ratio))
+        hard_count = min(max(0, hard_count), self.sample_points, active_count)
+        if hard_count <= 0:
+            perm = torch.randperm(active_count, device=active_indices.device)[:self.sample_points]
+            return active_indices[perm], {
+                "hard_sample_count": 0.0,
+                "random_sample_count": float(self.sample_points),
+                "candidate_count": float(self.sample_points),
+                "sampling_mode": effective_sampling_mode,
+                "difficulty_score_mode": effective_difficulty_mode,
+                "hard_ratio": float(effective_hard_ratio),
+                "tail_stable_candidate_ratio": 0.0,
+                "tail_high_conf_candidate_ratio": 0.0,
+                "tail_sample_high_conf_ratio": 0.0,
+                "tail_scan_candidate_ratio": 0.0,
+            }
+
+        if effective_sampling_mode == "hardest_global_mixed":
+            requested_hard = self.sample_points if not effective_random_sample_fallback else hard_count
+            hard_positions = self._mine_global_hard_positions(
+                means,
+                active_indices,
+                sparse_points,
+                support_score,
+                context,
+                requested_hard,
+                quats,
+                scales,
+            )
+            hard_indices = active_indices[hard_positions]
+            random_count = self.sample_points - int(hard_indices.numel())
+            if random_count > 0 and effective_random_sample_fallback:
+                remaining_mask = torch.ones((active_count,), dtype=torch.bool, device=active_indices.device)
+                remaining_mask[hard_positions] = False
+                remaining_indices = active_indices[remaining_mask]
+                random_count = min(random_count, int(remaining_indices.numel()))
+                random_perm = torch.randperm(int(remaining_indices.numel()), device=active_indices.device)[:random_count]
+                random_indices = remaining_indices[random_perm]
+                sampled_indices = torch.cat([hard_indices, random_indices], dim=0)
+            else:
+                random_count = 0
+                sampled_indices = hard_indices
+            candidate_count = float(active_count)
+            hard_sample_count = float(int(hard_indices.numel()))
+        else:
+            candidate_count = min(active_count, max(self.sample_points, hard_count * self.hard_candidate_multiplier))
+            candidate_perm = torch.randperm(active_count, device=active_indices.device)[:candidate_count]
+            candidate_indices = active_indices[candidate_perm]
+            with torch.no_grad():
+                candidate_quats = None if quats is None else quats[candidate_indices].detach()
+                candidate_scales = None if scales is None else scales[candidate_indices].detach()
+                candidate_scores = self._compute_difficulty_scores(
+                    means[candidate_indices].detach(),
+                    sparse_points,
+                    support_score,
+                    candidate_quats,
+                    candidate_scales,
+                    difficulty_mode=effective_difficulty_mode,
+                )
+            hard_pos = torch.topk(candidate_scores, k=hard_count, largest=True).indices
+            hard_indices = candidate_indices[hard_pos]
+
+            remaining_mask = torch.ones((active_count,), dtype=torch.bool, device=active_indices.device)
+            remaining_mask[candidate_perm[hard_pos]] = False
+            remaining_indices = active_indices[remaining_mask]
+
+            random_count = self.sample_points - hard_count
+            if random_count > 0 and effective_random_sample_fallback:
+                random_count = min(random_count, int(remaining_indices.numel()))
+                random_perm = torch.randperm(int(remaining_indices.numel()), device=active_indices.device)[:random_count]
+                random_indices = remaining_indices[random_perm]
+                sampled_indices = torch.cat([hard_indices, random_indices], dim=0)
+            elif random_count > 0:
+                candidate_keep = min(candidate_count, self.sample_points)
+                keep_pos = torch.topk(candidate_scores, k=candidate_keep, largest=True).indices
+                sampled_indices = candidate_indices[keep_pos]
+                random_count = 0
+            else:
+                sampled_indices = hard_indices
+            hard_sample_count = float(hard_count)
+
+        shuffle_perm = torch.randperm(int(sampled_indices.numel()), device=active_indices.device)
+        sampled_indices = sampled_indices[shuffle_perm]
+        return sampled_indices, {
+            "hard_sample_count": hard_sample_count,
+            "random_sample_count": float(random_count),
+            "candidate_count": float(candidate_count),
+            "sampling_mode": effective_sampling_mode,
+            "difficulty_score_mode": effective_difficulty_mode,
+            "hard_ratio": float(effective_hard_ratio),
+            "tail_stable_candidate_ratio": 0.0,
+            "tail_high_conf_candidate_ratio": 0.0,
+            "tail_sample_high_conf_ratio": 0.0,
+        }
 
     def compute(self, context):
         if not self.is_active(context):
             zero = zero_scalar_like(context)
-            return zero, {"active": 0.0, "sampled": 0.0, "distance_mean": 0.0}
+            return zero, {
+                "active": 0.0,
+                "sampled": 0.0,
+                "distance_mean": 0.0,
+                "orientation_loss": 0.0,
+                "orientation_alignment_mean": 0.0,
+                "orientation_alignment_p50": 0.0,
+                "orientation_alignment_p90": 0.0,
+                "anisotropic_scale_target_loss": 0.0,
+                "target_tangent_scale_mean": 0.0,
+                "target_tangent_scale_cap_mean": 0.0,
+                "target_normal_scale_mean": 0.0,
+                "gaussian_tangent_scale_mean": 0.0,
+                "gaussian_normal_scale_mean": 0.0,
+                "stable_plane_ratio": 0.0,
+                "loss_residual_mean": 0.0,
+                "normal_scale_loss": 0.0,
+                "tail_phase_active": 0.0,
+                "point_to_plane_loss_active": 0.0,
+                "tail_stable_candidate_ratio": 0.0,
+                "tail_high_conf_candidate_ratio": 0.0,
+                "tail_sample_high_conf_ratio": 0.0,
+                "tail_scan_candidate_ratio": 0.0,
+                "tail_point_to_plane_effective_ratio": 0.0,
+                "tail_confidence_mask_ratio": 0.0,
+                "tail_plane_confidence_mean": 0.0,
+            }
 
         sparse_points = context.get("colmap_sparse_points")
         sparse_track_len = context.get("colmap_sparse_track_len")
         sparse_reproj_error = context.get("colmap_sparse_reproj_error")
+        sparse_brightness_score = context.get("colmap_sparse_brightness_score")
+        sparse_gradient_score = context.get("colmap_sparse_gradient_score")
         means = context.get("gaussian_means")
+        quats = context.get("gaussian_quats")
+        scales = context.get("gaussian_scales")
         opacities = context.get("gaussian_opacities")
         if sparse_points is None:
             raise RuntimeError("SparsePointRegularizationLoss requires colmap_sparse_points in context.")
@@ -474,53 +1490,139 @@ class SparsePointRegularizationLoss(BaseLossModule):
         if sparse_points.ndim != 2 or sparse_points.shape[1] != 3:
             raise RuntimeError(f"SparsePointRegularizationLoss expects colmap_sparse_points with shape [N,3], got {tuple(sparse_points.shape)}")
 
+        total_gaussians = int(means.shape[0])
         opacity_values = torch.sigmoid(opacities.reshape(-1))
         active_indices = torch.nonzero(opacity_values > self.min_opacity, as_tuple=False).squeeze(-1)
         if active_indices.numel() == 0:
             zero = zero_scalar_like(context)
-            return zero, {"active": 1.0, "sampled": 0.0, "distance_mean": 0.0}
+            return zero, {
+                "active": 1.0,
+                "active_count": 0.0,
+                "active_ratio": 0.0,
+                "sampled": 0.0,
+                "sampled_ratio": 0.0,
+                "distance_mean": 0.0,
+                "orientation_loss": 0.0,
+                "orientation_alignment_mean": 0.0,
+                "orientation_alignment_p50": 0.0,
+                "orientation_alignment_p90": 0.0,
+                "anisotropic_scale_target_loss": 0.0,
+                "target_tangent_scale_mean": 0.0,
+                "target_tangent_scale_cap_mean": 0.0,
+                "target_normal_scale_mean": 0.0,
+                "gaussian_tangent_scale_mean": 0.0,
+                "gaussian_normal_scale_mean": 0.0,
+                "stable_plane_ratio": 0.0,
+                "loss_residual_mean": 0.0,
+                "normal_scale_loss": 0.0,
+                "tail_phase_active": 0.0,
+                "point_to_plane_loss_active": 0.0,
+                "tail_stable_candidate_ratio": 0.0,
+                "tail_high_conf_candidate_ratio": 0.0,
+                "tail_sample_high_conf_ratio": 0.0,
+                "tail_scan_candidate_ratio": 0.0,
+                "tail_point_to_plane_effective_ratio": 0.0,
+                "tail_confidence_mask_ratio": 0.0,
+                "tail_plane_confidence_mean": 0.0,
+            }
 
-        active_means = means[active_indices]
-        sample_count = min(int(active_indices.numel()), self.sample_points)
-        if active_indices.numel() > sample_count:
-            perm = torch.randperm(active_indices.numel(), device=active_indices.device)[:sample_count]
-            active_indices = active_indices[perm]
-        sampled_means = means[active_indices]
-
-        quality_score, density_score, support_score = self._get_sparse_support_scores(
+        quality_score, density_score, brightness_score, gradient_score, support_score = self._get_sparse_support_scores(
             sparse_points,
             sparse_track_len,
             sparse_reproj_error,
+            sparse_brightness_score,
+            sparse_gradient_score,
         )
+        sampled_indices, sampling_logs = self._sample_active_indices(means, active_indices, sparse_points, support_score, context, quats, scales)
+        sample_count = int(sampled_indices.numel())
+        sampled_means = means[sampled_indices]
+        sampled_quats = None if quats is None else quats[sampled_indices]
+        sampled_scales = None if scales is None else scales[sampled_indices]
 
-        distances = torch.cdist(sampled_means, sparse_points)
-        knn_k = min(self.knn_k, int(sparse_points.shape[0]))
-        knn_dist, knn_idx = torch.topk(distances, k=knn_k, dim=1, largest=False)
-        knn_points = sparse_points[knn_idx]
-        knn_support = support_score[knn_idx]
-        knn_weights = knn_support / knn_dist.clamp_min(self.knn_eps)
-        knn_weights = knn_weights / knn_weights.sum(dim=1, keepdim=True).clamp_min(self.knn_eps)
-        target_points = (knn_points * knn_weights.unsqueeze(-1)).sum(dim=1)
-        target_dist = torch.norm(sampled_means - target_points, dim=1)
+        neighborhood = self._build_support_neighborhood(sampled_means, sparse_points, support_score)
+        tail_phase_active = self._is_tail_phase(context)
+        residual_bundle = self._compute_residual_bundle(sampled_means, neighborhood, sampled_quats, sampled_scales, tail_phase_active=tail_phase_active)
+        target_dist = residual_bundle["residual"]
+        monitor_dist = residual_bundle["monitor_residual"]
+        effective_difficulty_mode = sampling_logs.get("difficulty_score_mode", self._effective_difficulty_mode(context))
+        sampled_min_sparse_distance = None
+        if effective_difficulty_mode in {"min_sparse_dist", "vsurface_mixed", "stable_surface_mixed"}:
+            sampled_min_sparse_distance = self._compute_min_sparse_distance(sampled_means.detach(), sparse_points)
+        difficulty_scores = self._compute_difficulty_scores(
+            sampled_means.detach(),
+            sparse_points,
+            support_score,
+            None if sampled_quats is None else sampled_quats.detach(),
+            None if sampled_scales is None else sampled_scales.detach(),
+            difficulty_mode=effective_difficulty_mode,
+            residual_bundle=residual_bundle,
+            min_sparse_distance=sampled_min_sparse_distance,
+        )
         if self.robust_scale > 0.0:
             robust_loss = torch.sqrt(target_dist.square() + self.robust_scale * self.robust_scale) - self.robust_scale
         else:
             robust_loss = target_dist
         loss = robust_loss.mean()
-        sampled_opacity = opacity_values[active_indices]
-        return loss, {
+        sampled_opacity = opacity_values[sampled_indices]
+        logs = {
             "active": 1.0,
+            "active_count": float(opacity_values.gt(self.min_opacity).sum().detach().item()),
+            "active_ratio": float(opacity_values.gt(self.min_opacity).float().mean().detach().item()) if total_gaussians > 0 else 0.0,
             "sampled": float(sample_count),
-            "distance_mean": float(target_dist.detach().mean().item()),
-            "knn_dist_mean": float(knn_dist.detach().mean().item()),
-            "knn_k": float(knn_k),
+            "sampled_ratio": float(sample_count / max(1, int(opacity_values.gt(self.min_opacity).sum().detach().item()))),
+            "distance_mean": float(monitor_dist.detach().mean().item()),
+            "knn_dist_mean": float(neighborhood["knn_dist"].detach().mean().item()),
+            "knn_k": float(neighborhood["neighbor_k"]),
             "robust_mean": float(robust_loss.detach().mean().item()),
+            "loss_residual_mean": float(target_dist.detach().mean().item()),
             "robust_scale": float(self.robust_scale),
             "opacity_mean": float(sampled_opacity.detach().mean().item()),
             "quality_score_mean": float(quality_score.detach().mean().item()),
             "density_score_mean": float(density_score.detach().mean().item()),
+            "brightness_score_mean": float(brightness_score.detach().mean().item()),
+            "gradient_score_mean": float(gradient_score.detach().mean().item()),
             "support_score_mean": float(support_score.detach().mean().item()),
+            "mode": self.mode,
+            "sampling_mode": sampling_logs.get("sampling_mode", self.sampling_mode),
+            "hard_ratio": float(sampling_logs.get("hard_ratio", self.hard_ratio)),
+            "difficulty_score_mode": effective_difficulty_mode,
+            "hard_sample_count": sampling_logs["hard_sample_count"],
+            "random_sample_count": sampling_logs["random_sample_count"],
+            "candidate_count": sampling_logs["candidate_count"],
+            "tail_stable_candidate_ratio": float(sampling_logs.get("tail_stable_candidate_ratio", 0.0)),
+            "tail_high_conf_candidate_ratio": float(sampling_logs.get("tail_high_conf_candidate_ratio", 0.0)),
+            "tail_sample_high_conf_ratio": float(sampling_logs.get("tail_sample_high_conf_ratio", 0.0)),
+            "tail_scan_candidate_ratio": float(sampling_logs.get("tail_scan_candidate_ratio", 0.0)),
+            "difficulty_mean": float(difficulty_scores.detach().mean().item()),
+            "normal_residual_mean": float(residual_bundle["normal_residual"].detach().mean().item()),
+            "tangent_residual_mean": float(residual_bundle["tangent_residual"].detach().mean().item()),
+            "point_to_plane_fallback_ratio": float(residual_bundle["fallback_mask"].float().mean().detach().item()),
+            "normal_scale_loss": _masked_mean(residual_bundle["normal_scale_loss"], residual_bundle["stable_mask"]),
+            "orientation_loss": _masked_mean(residual_bundle["orientation_loss"], residual_bundle["stable_mask"]),
+            "orientation_alignment_mean": _masked_mean(residual_bundle["orientation_alignment"], residual_bundle["stable_mask"]),
+            "anisotropic_scale_target_loss": _masked_mean(residual_bundle["anisotropic_scale_target_loss"], residual_bundle["stable_mask"]),
+            "target_tangent_scale_mean": _masked_mean(residual_bundle["target_tangent_scale"], residual_bundle["stable_mask"]),
+            "target_tangent_scale_cap_mean": _masked_mean(residual_bundle["target_tangent_scale_cap"], residual_bundle["stable_mask"]),
+            "target_normal_scale_mean": _masked_mean(residual_bundle["target_normal_scale"], residual_bundle["stable_mask"]),
+            "gaussian_tangent_scale_mean": _masked_mean(residual_bundle["gaussian_tangent_scale"], residual_bundle["stable_mask"]),
+            "gaussian_normal_scale_mean": _masked_mean(residual_bundle["gaussian_normal_scale"], residual_bundle["stable_mask"]),
+            "stable_plane_ratio": float(residual_bundle["stable_mask"].float().mean().detach().item()),
+            "tail_phase_active": float(tail_phase_active),
+            "point_to_plane_loss_active": float((not tail_phase_active) or residual_bundle["tail_point_to_plane_active"]),
+            "tail_point_to_plane_effective_ratio": float(residual_bundle["tail_confidence_mask"].float().mean().detach().item()) if tail_phase_active else 0.0,
+            "tail_confidence_mask_ratio": float(residual_bundle["tail_confidence_mask"].float().mean().detach().item()) if tail_phase_active else 0.0,
+            "tail_plane_confidence_mean": _masked_mean(residual_bundle["plane_confidence"], residual_bundle["tail_confidence_mask"]) if tail_phase_active else 0.0,
         }
+        logs.update(_quantile_logs("distance", monitor_dist, [(0.50, "p50"), (0.90, "p90"), (0.99, "p99")]))
+        logs.update(_quantile_logs("plane_residual", residual_bundle["plane_residual"], [(0.50, "p50"), (0.90, "p90")]))
+        logs.update(_quantile_logs("quality_score", quality_score, [(0.10, "p10"), (0.50, "p50"), (0.90, "p90")]))
+        logs.update(_quantile_logs("density_score", density_score, [(0.10, "p10"), (0.50, "p50"), (0.90, "p90")]))
+        logs.update(_quantile_logs("brightness_score", brightness_score, [(0.10, "p10"), (0.50, "p50"), (0.90, "p90")]))
+        logs.update(_quantile_logs("gradient_score", gradient_score, [(0.10, "p10"), (0.50, "p50"), (0.90, "p90")]))
+        logs.update(_quantile_logs("support_score", support_score, [(0.10, "p10"), (0.50, "p50"), (0.90, "p90")]))
+        logs.update(_quantile_logs("difficulty", difficulty_scores, [(0.50, "p50"), (0.90, "p90")]))
+        logs.update(_masked_quantile_logs("orientation_alignment", residual_bundle["orientation_alignment"], residual_bundle["stable_mask"], [(0.50, "p50"), (0.90, "p90")]))
+        return loss, logs
 
 
 class LowLightConsistencyLoss(BaseLossModule):

@@ -1,40 +1,106 @@
-﻿python tools/extract_marigold_depth.py dataset/Validation/lowlight_validation/validation/BlueHawaii --checkpoint /root/autodl-tmp/3DRR_codebase/checkpoints/marigold-depth-lcm-v1-0 --device cuda --skip-existing
-python tools/extract_structure_prior.py dataset/Validation/lowlight_validation/validation/BlueHawaii --device cuda --skip-existing
-
-python train.py -c config/stage4_tuned/bluehawaii.yaml
-python eval.py -w outputs/stage4_tuned/BlueHawaii/step_15000/step_15000.pt
+﻿conda activate low-light
+cd autodl-tmp/3DRR_codebase
+python tools/extract_marigold_depth.py dataset/Validation/lowlight_validation/validation/BlueHawaii --checkpoint /root/autodl-tmp/3DRR_codebase/checkpoints/marigold-depth-lcm-v1-0 --device cuda
+python tools/extract_structure_prior.py dataset/Validation/lowlight_validation/validation/BlueHawaii --device cuda
+python tools/build_fixed_pose_colmap_sparse_init.py dataset/Validation/lowlight_validation/validation/BlueHawaii --config-path config/stage4_tuned_colmap/bluehawaii.yaml --colmap-bin colmap --overwrite
+python train.py -c config/stage4_tuned_colmap/bluehawaii.yaml
+python eval.py -w outputs/stage4_tuned_colmap/BlueHawaii/step_15000/step_15000.pt
 python train.py -c config/stage5b_ft/bluehawaii.yaml
-python eval.py -w outputs/stage5b_ft/BlueHawaii/step_2000/step_2000.pt
-python eval.py -w outputs/stage5b_ft/BlueHawaii/step_3000/step_3000.pt
 python eval.py -w outputs/stage5b_ft/BlueHawaii/step_5000/step_5000.pt
-python train.py -c config/stage6_shadow_ft_v2/bluehawaii.yaml
-python eval.py -w outputs/stage6_shadow_ft_v2/BlueHawaii/step_2000/step_2000.pt
-python eval.py -w outputs/stage6_shadow_ft_v2/BlueHawaii/step_3000/step_3000.pt
-python eval.py -w outputs/stage6_shadow_ft_v2/BlueHawaii/step_5000/step_5000.pt
+python train.py -c config/stage6_adaptive_chroma_ycbcr_additive/bluehawaii.yaml
+python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/BlueHawaii/step_5000/step_5000.pt
+
+conda activate low-light
+cd autodl-tmp/3DRR_codebase
+python train.py -c config/stage6_adaptive_chroma_ycbcr_additive/chocolate.yaml
+python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/Chocolate/step_5000/step_5000.pt
+python train.py -c config/stage6_adaptive_chroma_ycbcr_additive/cupcake.yaml
+python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/Cupcake/step_5000/step_5000.pt
+python train.py -c config/stage6_adaptive_chroma_ycbcr_additive/gearworks.yaml
+python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/GearWorks/step_5000/step_5000.pt
+python train.py -c config/stage6_adaptive_chroma_ycbcr_additive/laboratory.yaml
+python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/Laboratory/step_5000/step_5000.pt
+python train.py -c config/stage6_adaptive_chroma_ycbcr_additive/milkcookie.yaml
+python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/MilkCookie/step_5000/step_5000.pt
+python train.py -c config/stage6_adaptive_chroma_ycbcr_additive/popcorn.yaml
+python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/Popcorn/step_5000/step_5000.pt
+python train.py -c config/stage6_adaptive_chroma_ycbcr_additive/sculpture.yaml
+python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/Sculpture/step_5000/step_5000.pt
+python train.py -c config/stage6_adaptive_chroma_ycbcr_additive/ujikintoki.yaml
+python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/Ujikintoki/step_5000/step_5000.pt; /usr/bin/shutdown
+
+
+conda activate low-light
+cd autodl-tmp/3DRR_codebase
+python eval.py -w outputs/stage4_tuned_colmap/Chocolate/step_15000/step_15000.pt
+python eval.py -w outputs/stage5b_ft/Chocolate/step_5000/step_5000.pt
+python eval.py -w outputs/stage4_tuned_colmap/Cupcake/step_15000/step_15000.pt
+python eval.py -w outputs/stage5b_ft/Cupcake/step_5000/step_5000.pt
+python eval.py -w outputs/stage4_tuned_colmap/GearWorks/step_15000/step_15000.pt
+python eval.py -w outputs/stage5b_ft/GearWorks/step_5000/step_5000.pt
+python eval.py -w outputs/stage4_tuned_colmap/Laboratory/step_15000/step_15000.pt
+python eval.py -w outputs/stage5b_ft/Laboratory/step_5000/step_5000.pt
+python eval.py -w outputs/stage4_tuned_colmap/MilkCookie/step_15000/step_15000.pt
+python eval.py -w outputs/stage5b_ft/MilkCookie/step_5000/step_5000.pt
+python eval.py -w outputs/stage4_tuned_colmap/Popcorn/step_15000/step_15000.pt
+python eval.py -w outputs/stage5b_ft/Popcorn/step_5000/step_5000.pt
+python eval.py -w outputs/stage4_tuned_colmap/Sculpture/step_15000/step_15000.pt
+python eval.py -w outputs/stage5b_ft/Sculpture/step_5000/step_5000.pt
+python eval.py -w outputs/stage4_tuned_colmap/Ujikintoki/step_15000/step_15000.pt
+python eval.py -w outputs/stage5b_ft/Ujikintoki/step_5000/step_5000.pt
+
 
 
 Development
 
-python tools/extract_marigold_depth.py dataset/Development/lowlight_development/development/Chocolate --checkpoint /root/autodl-tmp/3DRR_codebase/checkpoints/marigold-depth-lcm-v1-0 --device cuda --skip-existing
+python tools/extract_marigold_depth.py dataset/Development/lowlight_development/development/Chocolate --checkpoint ~/3DRR_codebase/checkpoints/marigold-depth-lcm-v1-0 --device cuda --skip-existing
 python tools/extract_structure_prior.py dataset/Development/lowlight_development/development/Chocolate --device cuda --skip-existing
 python tools/build_fixed_pose_colmap_sparse_init.py dataset/Development/lowlight_development/development/Chocolate --config-path config/stage4_tuned_colmap/chocolate.yaml --colmap-bin colmap --overwrite
 python train.py -c config/stage4_tuned_colmap/chocolate.yaml
 python eval.py -w outputs/stage4_tuned_colmap/Chocolate/step_15000/step_15000.pt
 python train.py -c config/stage5b_ft/chocolate.yaml
 python eval.py -w outputs/stage5b_ft/Chocolate/step_5000/step_5000.pt
+python -c "
+import torch
+
+ckpt_on = torch.load('outputs/stage5b_ft_sparse/Chocolate/step_5000/step_5000.pt', map_location='cpu') 
+ckpt_off = torch.load('outputs/stage5b_ft_sparse/Chocolate/step_5000/step_5000.pt', map_location='cpu') 
+
+for key in ['means', 'opacities', 'scales', 'quats', 'sh0', 'shN']:
+    a = ckpt_on[key]
+    b = ckpt_off[key]
+    diff = (a - b).abs()
+    print(key, 'mean=', diff.mean().item(), 'max=', diff.max().item())
+"
+conda activate low-light
+cd autodl-tmp/3DRR_codebase
 python train.py -c config/stage6_adaptive_chroma_ycbcr_additive/chocolate.yaml
 python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/Chocolate/step_5000/step_5000.pt
 
 
 
-python tools/extract_marigold_depth.py dataset/Development/lowlight_development/development/Cupcake --checkpoint /root/autodl-tmp/3DRR_codebase/checkpoints/marigold-depth-lcm-v1-0 --device cuda --skip-existing
+python tools/extract_marigold_depth.py dataset/Development/lowlight_development/development/Cupcake --checkpoint ~/3DRR_codebase/checkpoints/marigold-depth-lcm-v1-0 --device cuda --skip-existing
 python tools/extract_structure_prior.py dataset/Development/lowlight_development/development/Cupcake --device cuda --skip-existing
 python tools/build_fixed_pose_colmap_sparse_init.py dataset/Development/lowlight_development/development/Cupcake --config-path config/stage4_tuned_colmap/cupcake.yaml --colmap-bin colmap --overwrite
 python train.py -c config/stage4_tuned_colmap/cupcake.yaml
 python eval.py -w outputs/stage4_tuned_colmap/Cupcake/step_15000/step_15000.pt
 python train.py -c config/stage5b_ft/cupcake.yaml
 python eval.py -w outputs/stage5b_ft/Cupcake/step_5000/step_5000.pt
+python -c "
+import torch
+
+ckpt_on = torch.load('outputs/stage5b_ft_sparse/Cupcake/step_5000/step_5000.pt', map_location='cpu') 
+ckpt_off = torch.load('outputs/stage5b_ft_sparse/Cupcake/step_5000/step_5000.pt', map_location='cpu') 
+
+for key in ['means', 'opacities', 'scales', 'quats', 'sh0', 'shN']:
+    a = ckpt_on[key]
+    b = ckpt_off[key]
+    diff = (a - b).abs()
+    print(key, 'mean=', diff.mean().item(), 'max=', diff.max().item())
+"
 python train.py -c config/stage6_adaptive_chroma_ycbcr_additive/cupcake.yaml
+python eval.py -w outputs/stage6_ablation_illum_recon_map/Cupcake/step_5000/step_5000.pt
+python eval.py -w outputs/stage6_ablation_residual/Cupcake/step_5000/step_5000.pt
 python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/Cupcake/step_5000/step_5000.pt
 
 
@@ -46,6 +112,18 @@ python train.py -c config/stage4_tuned_colmap/gearworks.yaml
 python eval.py -w outputs/stage4_tuned_colmap/GearWorks/step_15000/step_15000.pt
 python train.py -c config/stage5b_ft/gearworks.yaml
 python eval.py -w outputs/stage5b_ft/GearWorks/step_5000/step_5000.pt
+python -c "
+import torch
+
+ckpt_on = torch.load('outputs/stage5b_ft_sparse/GearWorks/step_5000/step_5000.pt', map_location='cpu') 
+ckpt_off = torch.load('outputs/stage5b_ft_sparse/GearWorks/step_5000/step_5000.pt', map_location='cpu') 
+
+for key in ['means', 'opacities', 'scales', 'quats', 'sh0', 'shN']:
+    a = ckpt_on[key]
+    b = ckpt_off[key]
+    diff = (a - b).abs()
+    print(key, 'mean=', diff.mean().item(), 'max=', diff.max().item())
+"
 python train.py -c config/stage6_adaptive_chroma_ycbcr_additive/gearworks.yaml
 python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/GearWorks/step_5000/step_5000.pt
 
@@ -56,9 +134,25 @@ python tools/extract_structure_prior.py dataset/Development/lowlight_development
 python tools/build_fixed_pose_colmap_sparse_init.py dataset/Development/lowlight_development/development/Laboratory --config-path config/stage4_tuned_colmap/laboratory.yaml --colmap-bin colmap --overwrite
 python train.py -c config/stage4_tuned_colmap/laboratory.yaml
 python eval.py -w outputs/stage4_tuned_colmap/Laboratory/step_15000/step_15000.pt
+conda activate low-light
+cd autodl-tmp/3DRR_codebase
 python train.py -c config/stage5b_ft/laboratory.yaml
 python eval.py -w outputs/stage5b_ft/Laboratory/step_5000/step_5000.pt
+python -c "
+import torch
+
+ckpt_on = torch.load('outputs/stage5b_ft_sparse/Laboratory/step_5000/step_5000.pt', map_location='cpu') 
+ckpt_off = torch.load('outputs/stage5b_ft_sparse/Laboratory/step_5000/step_5000.pt', map_location='cpu') 
+
+for key in ['means', 'opacities', 'scales', 'quats', 'sh0', 'shN']:
+    a = ckpt_on[key]
+    b = ckpt_off[key]
+    diff = (a - b).abs()
+    print(key, 'mean=', diff.mean().item(), 'max=', diff.max().item())
+"
 python train.py -c config/stage6_adaptive_chroma_ycbcr_additive/laboratory.yaml
+python eval.py -w outputs/stage6_ablation_illum_recon_map/Laboratory/step_5000/step_5000.pt
+python eval.py -w outputs/stage6_ablation_residual/Laboratory/step_5000/step_5000.pt
 python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/Laboratory/step_5000/step_5000.pt
 
 
@@ -68,14 +162,26 @@ python tools/extract_structure_prior.py dataset/Test/lowlight_test/test/MilkCook
 python tools/build_fixed_pose_colmap_sparse_init.py dataset/Test/lowlight_test/test/MilkCookie --config-path config/stage4_tuned_colmap/milkcookie.yaml --colmap-bin colmap --overwrite
 python train.py -c config/stage4_tuned_colmap/milkcookie.yaml
 python eval.py -w outputs/stage4_tuned_colmap/MilkCookie/step_15000/step_15000.pt
-python train.py -c config/stage5b_ft/milkcookie.yaml
-python eval.py -w outputs/stage5b_ft/MilkCookie/step_5000/step_5000.pt
-python train.py -c config/stage6_adaptive_chroma_ycbcr_additive/milkcookie.yaml
-python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/MilkCookie/step_5000/step_5000.pt
-
 conda activate low-light
 cd autodl-tmp/3DRR_codebase
-python train.py -c config/stage6_color_refine_checker/milkcookie.yaml
+python train.py -c config/stage5b_ft/milkcookie.yaml
+python eval.py -w outputs/stage5b_ft/MilkCookie/step_5000/step_5000.pt
+python -c "
+import torch
+
+ckpt_on = torch.load('outputs/stage5b_ft_sparse/MilkCookie/step_5000/step_5000.pt', map_location='cpu') 
+ckpt_off = torch.load('outputs/stage5b_ft_sparse/MilkCookie/step_5000/step_5000.pt', map_location='cpu') 
+
+for key in ['means', 'opacities', 'scales', 'quats', 'sh0', 'shN']:
+    a = ckpt_on[key]
+    b = ckpt_off[key]
+    diff = (a - b).abs()
+    print(key, 'mean=', diff.mean().item(), 'max=', diff.max().item())
+"
+python train.py -c config/stage6_adaptive_chroma_ycbcr_additive/milkcookie.yaml
+python eval.py -w outputs/stage6_ablation_illum_recon_map/MilkCookie/step_5000/step_5000.pt
+python eval.py -w outputs/stage6_ablation_residual/MilkCookie/step_5000/step_5000.pt
+python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/MilkCookie/step_5000/step_5000.pt
 
 
 
@@ -87,8 +193,48 @@ python train.py -c config/stage4_tuned_colmap/popcorn.yaml
 python eval.py -w outputs/stage4_tuned_colmap/Popcorn/step_15000/step_15000.pt
 python train.py -c config/stage5b_ft/popcorn.yaml
 python eval.py -w outputs/stage5b_ft/Popcorn/step_5000/step_5000.pt
+python -c "
+import torch
+
+ckpt_on = torch.load('outputs/stage5b_ft_sparse/Popcorn/step_5000/step_5000.pt', map_location='cpu') 
+ckpt_off = torch.load('outputs/stage5b_ft_sparse/Popcorn/step_5000/step_5000.pt', map_location='cpu') 
+
+for key in ['means', 'opacities', 'scales', 'quats', 'sh0', 'shN']:
+    a = ckpt_on[key]
+    b = ckpt_off[key]
+    diff = (a - b).abs()
+    print(key, 'mean=', diff.mean().item(), 'max=', diff.max().item())
+"
 python train.py -c config/stage6_adaptive_chroma_ycbcr_additive/popcorn.yaml
+python eval.py -w outputs/stage6_ablation_illum_recon_map/Popcorn/step_5000/step_5000.pt
+python eval.py -w outputs/stage6_ablation_residual/Popcorn/step_5000/step_5000.pt
 python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/Popcorn/step_5000/step_5000.pt
+
+
+
+python tools/extract_marigold_depth.py dataset/Test/lowlight_test/test/Sculpture --checkpoint /root/autodl-tmp/3DRR_codebase/checkpoints/marigold-depth-lcm-v1-0 --device cuda --skip-existing
+python tools/extract_structure_prior.py dataset/Test/lowlight_test/test/Sculpture --device cuda --skip-existing
+python tools/build_fixed_pose_colmap_sparse_init.py dataset/Test/lowlight_test/test/Sculpture --config-path config/stage4_tuned_colmap/sculpture.yaml --colmap-bin colmap --overwrite
+python train.py -c config/stage4_tuned_colmap/sculpture.yaml
+python eval.py -w outputs/stage4_tuned_colmap/Sculpture/step_15000/step_15000.pt
+python train.py -c config/stage5b_ft/sculpture.yaml
+python eval.py -w outputs/stage5b_ft/Sculpture/step_5000/step_5000.pt
+python -c "
+import torch
+
+ckpt_on = torch.load('outputs/stage5b_ft_sparse/Sculpture/step_5000/step_5000.pt', map_location='cpu') 
+ckpt_off = torch.load('outputs/stage5b_ft_sparse/Sculpture/step_5000/step_5000.pt', map_location='cpu') 
+
+for key in ['means', 'opacities', 'scales', 'quats', 'sh0', 'shN']:
+    a = ckpt_on[key]
+    b = ckpt_off[key]
+    diff = (a - b).abs()
+    print(key, 'mean=', diff.mean().item(), 'max=', diff.max().item())
+"
+python train.py -c config/stage6_adaptive_chroma_ycbcr_additive/sculpture.yaml
+python eval.py -w outputs/stage6_ablation_illum_recon_map/Sculpture/step_5000/step_5000.pt
+python eval.py -w outputs/stage6_ablation_residual/Sculpture/step_5000/step_5000.pt
+python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/Sculpture/step_5000/step_5000.pt
 
 
 
@@ -99,6 +245,20 @@ python train.py -c config/stage4_tuned_colmap/ujikintoki.yaml
 python eval.py -w outputs/stage4_tuned_colmap/Ujikintoki/step_15000/step_15000.pt
 python train.py -c config/stage5b_ft/ujikintoki.yaml
 python eval.py -w outputs/stage5b_ft/Ujikintoki/step_5000/step_5000.pt
+python -c "
+import torch
+
+ckpt_on = torch.load('outputs/stage5b_ft_sparse/Ujikintoki/step_5000/step_5000.pt', map_location='cpu') 
+ckpt_off = torch.load('outputs/stage5b_ft_sparse/Ujikintoki/step_5000/step_5000.pt', map_location='cpu') 
+
+for key in ['means', 'opacities', 'scales', 'quats', 'sh0', 'shN']:
+    a = ckpt_on[key]
+    b = ckpt_off[key]
+    diff = (a - b).abs()
+    print(key, 'mean=', diff.mean().item(), 'max=', diff.max().item())
+"
 python train.py -c config/stage6_adaptive_chroma_ycbcr_additive/ujikintoki.yaml
+python eval.py -w outputs/stage6_ablation_illum_recon_map/Ujikintoki/step_5000/step_5000.pt
+python eval.py -w outputs/stage6_ablation_residual/Ujikintoki/step_5000/step_5000.pt
 python eval.py -w outputs/stage6_adaptive_chroma_ycbcr_additive/Ujikintoki/step_5000/step_5000.pt
 

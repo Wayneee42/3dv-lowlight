@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import warnings
+from pathlib import Path
 
 import torch
 import yaml
@@ -12,6 +13,7 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 
 from core.data import Blender
+from core.data.blender import load_img
 from core.libs import ConfigDict, ssim
 from core.model import Simple3DGS
 
@@ -43,10 +45,29 @@ def lpips_score(lpips_model, rendered, target):
 
 
 
-def can_compute_metrics(dataset):
+def resolve_metric_gt_paths(dataset, scene_name):
     if len(dataset._records_keys) == 0:
-        return False
-    return all(os.path.exists(dataset._records[key]["file_path"]) for key in dataset._records_keys)
+        return None
+
+    repo_root = Path(__file__).resolve().parent
+    gt_paths = []
+    for key in dataset._records_keys:
+        record = dataset._records[key]
+        candidates = []
+
+        file_path = record.get("file_path", None)
+        if file_path is not None:
+            candidates.append(Path(file_path))
+
+        relative_path = record.get("relative_path", None)
+        if scene_name and relative_path:
+            candidates.append(repo_root / "lowlight" / scene_name / relative_path.replace("/", os.sep))
+
+        resolved_path = next((candidate for candidate in candidates if candidate.exists()), None)
+        if resolved_path is None:
+            return None
+        gt_paths.append(str(resolved_path))
+    return gt_paths
 
 
 
@@ -81,6 +102,15 @@ def _cfg_get(cfg, key, default):
     except AttributeError:
         return default
 
+
+
+def resolve_train_export_options(meta_cfg):
+    eval_cfg = _cfg_get(meta_cfg, "EVAL", None)
+    export_train_views = bool(_cfg_get(eval_cfg, "EXPORT_TRAIN_VIEWS", False))
+    train_render_dir = str(_cfg_get(eval_cfg, "TRAIN_RENDER_DIR", "train_render"))
+    if not train_render_dir:
+        train_render_dir = "train_render"
+    return export_train_views, train_render_dir
 
 
 def build_eval_heads(meta_cfg):
@@ -150,6 +180,13 @@ def save_render_outputs(render_outputs, frame_key, output_dir):
     return final_image
 
 
+def load_rendered_output(output_dir, frame_key, device):
+    rendered_path = os.path.join(output_dir, f"{frame_key}.png")
+    if not os.path.exists(rendered_path):
+        raise FileNotFoundError(f"Rendered image not found for frame '{frame_key}': {rendered_path}")
+    return load_img(rendered_path, channel=3).float().to(device)[:3].permute(1, 2, 0) / 255.0
+
+
 @torch.no_grad()
 def evaluate(checkpoint_path, device="cuda"):
     ckpt_dir = os.path.dirname(checkpoint_path)
@@ -161,20 +198,30 @@ def evaluate(checkpoint_path, device="cuda"):
     meta_cfg = ConfigDict(config_path=config_dict)
     cfg = meta_cfg.MODEL
     render_heads = build_eval_heads(meta_cfg)
+    export_train_views, train_render_dir = resolve_train_export_options(meta_cfg)
 
     test_dataset = Blender(meta_cfg.DATASET, split="test", load_images=False)
-    metric_dataset = Blender(meta_cfg.DATASET, split="test", load_images=True) if can_compute_metrics(test_dataset) else None
+    scene_name = _cfg_get(meta_cfg.DATASET, "NAME", None)
+    metric_gt_paths = resolve_metric_gt_paths(test_dataset, scene_name)
     H, W = test_dataset._data_info["img_h"], test_dataset._data_info["img_w"]
 
-    model = Simple3DGS(cfg, test_dataset._data_info).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    for key, value in ckpt.items():
-        model.splats[key] = torch.nn.Parameter(value)
-    model.sh_degree = model.sh_degree_max
-    model.eval()
-
     output_dir = os.path.join(ckpt_dir, "test")
-    os.makedirs(output_dir, exist_ok=True)
+    checkpoint_exists = os.path.exists(checkpoint_path)
+    model = None
+    if checkpoint_exists:
+        model = Simple3DGS(cfg, test_dataset._data_info).to(device)
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        for key, value in ckpt.items():
+            model.splats[key] = torch.nn.Parameter(value)
+        model.sh_degree = model.sh_degree_max
+        model.eval()
+        os.makedirs(output_dir, exist_ok=True)
+    else:
+        print(f"Checkpoint not found: {checkpoint_path}")
+        print(f"Skip rendering and evaluate existing outputs in: {output_dir}")
+        if not os.path.isdir(output_dir):
+            raise FileNotFoundError(f"Rendered output directory not found: {output_dir}")
+
     num_test = len(test_dataset._records_keys)
 
     lpips_model = try_build_lpips(device)
@@ -184,16 +231,19 @@ def evaluate(checkpoint_path, device="cuda"):
         metric_values["LPIPS"] = []
         per_view["LPIPS"] = {}
 
-    for index in tqdm(range(num_test), desc="Rendering"):
+    loop_desc = "Rendering" if checkpoint_exists else "Evaluating"
+    for index in tqdm(range(num_test), desc=loop_desc):
         data = test_dataset[index]
-        camtoworld = data["transforms"].to(device)
-        render_outputs = model(camtoworld, H, W, render_heads=render_heads)
         frame_key = data["infos"]["frame_key"]
-        rendered = save_render_outputs(render_outputs, frame_key, output_dir)
+        if checkpoint_exists:
+            camtoworld = data["transforms"].to(device)
+            render_outputs = model(camtoworld, H, W, render_heads=render_heads)
+            rendered = save_render_outputs(render_outputs, frame_key, output_dir)
+        else:
+            rendered = load_rendered_output(output_dir, frame_key, device)
 
-        if metric_dataset is not None:
-            gt_data = metric_dataset[index]
-            gt_hwc = gt_data["images"].to(device).permute(1, 2, 0)
+        if metric_gt_paths is not None:
+            gt_hwc = load_img(metric_gt_paths[index], channel=3).float().to(device)[:3].permute(1, 2, 0) / 255.0
             psnr_value = psnr(rendered, gt_hwc)
             ssim_value = float(ssim(rendered, gt_hwc).item())
             metric_values["PSNR"].append(psnr_value)
@@ -206,15 +256,32 @@ def evaluate(checkpoint_path, device="cuda"):
                 metric_values["LPIPS"].append(lpips_value)
                 per_view["LPIPS"][frame_key] = lpips_value
 
-    print(f"Rendered {num_test} images to {output_dir}/ | {model.num_gaussians} Gaussians")
+    if checkpoint_exists and export_train_views:
+        train_dataset = Blender(meta_cfg.DATASET, split="train", load_images=False)
+        train_output_dir = os.path.join(ckpt_dir, train_render_dir)
+        train_h, train_w = train_dataset._data_info["img_h"], train_dataset._data_info["img_w"]
+        os.makedirs(train_output_dir, exist_ok=True)
+        num_train = len(train_dataset._records_keys)
+        for index in tqdm(range(num_train), desc="Rendering train views"):
+            data = train_dataset[index]
+            frame_key = data["infos"]["frame_key"]
+            camtoworld = data["transforms"].to(device)
+            render_outputs = model(camtoworld, train_h, train_w, render_heads=render_heads)
+            save_render_outputs(render_outputs, frame_key, train_output_dir)
+        print(f"Rendered {num_train} train-view images to {train_output_dir}/")
 
-    if metric_dataset is not None:
+    if checkpoint_exists:
+        print(f"Rendered {num_test} images to {output_dir}/ | {model.num_gaussians} Gaussians")
+    else:
+        print(f"Evaluated {num_test} existing rendered images from {output_dir}/")
+
+    if metric_gt_paths is not None:
         summary = {metric_name: float(sum(values) / len(values)) for metric_name, values in metric_values.items() if values}
         write_metric_outputs(ckpt_dir, summary, per_view)
         for metric_name, value in summary.items():
             print(f"{metric_name}: {value:.6f}")
     else:
-        print("Ground-truth test images not found; skipped metric computation.")
+        print("Ground-truth test images not found in dataset paths or lowlight/<scene>/test; skipped metric computation.")
 
 
 if __name__ == "__main__":

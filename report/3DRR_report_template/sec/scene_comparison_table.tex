@@ -1,0 +1,73 @@
+\begin{table*}[!t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{4.0pt}
+\renewcommand{\arraystretch}{1.10}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lccccccccc@{}}
+\toprule
+Method & Chocolate & Cupcake & GearWorks & Laboratory
+& MilkCookie & Popcorn & Sculpture & Ujikintoki & Average \\
+\midrule
+& \multicolumn{9}{c}{PSNR$\uparrow$} \\
+\cmidrule(lr){2-10}
+3DGS & 7.89 & 4.42 & 6.90 & 7.59 & 6.15 & 7.46 & 5.85 & 6.23 & 6.56 \\
+AlethNeRF & 11.53 & \thirdcell{13.49} & 8.82 & 14.14 & \thirdcell{13.49}
+& 13.25 & \thirdcell{12.22} & 14.12 & 12.63 \\
+I2NeRF & \bestcell{19.77} & 12.68 & \secondcell{12.22}
+& \thirdcell{16.34} & \secondcell{14.78} & \thirdcell{17.08}
+& 9.64 & \secondcell{19.02} & \thirdcell{15.19} \\
+LITA-GS & \thirdcell{17.94} & 13.07 & \thirdcell{10.90}
+& \secondcell{17.56} & 12.74 & \bestcell{18.97}
+& \secondcell{12.84} & \thirdcell{18.82} & \secondcell{15.36} \\
+Luminance-GS & 7.33 & \secondcell{14.82} & 8.09 & 8.88 & 9.67
+& 11.33 & 9.79 & 9.36 & 9.91 \\
+\textbf{Ours} & \secondcell{19.09} & \bestcell{15.57} & \bestcell{15.61}
+& \bestcell{22.63} & \bestcell{16.01} & \secondcell{18.82}
+& \bestcell{15.52} & \bestcell{19.81} & \bestcell{17.88} \\
+\midrule
+& \multicolumn{9}{c}{SSIM$\uparrow$} \\
+\cmidrule(lr){2-10}
+3DGS & 0.084 & 0.064 & 0.081 & 0.041 & 0.052 & 0.062 & 0.018
+& 0.062 & 0.058 \\
+AlethNeRF & 0.406 & 0.552 & 0.217 & 0.484 & 0.567 & 0.452 & 0.208
+& 0.544 & 0.429 \\
+I2NeRF & \bestcell{0.571} & \thirdcell{0.608} & \secondcell{0.511}
+& \secondcell{0.630} & \secondcell{0.649} & \thirdcell{0.543}
+& 0.277 & \secondcell{0.666} & \secondcell{0.557} \\
+LITA-GS & \secondcell{0.541} & \secondcell{0.643} & 0.344
+& \thirdcell{0.597} & \thirdcell{0.573} & \secondcell{0.557}
+& \secondcell{0.343} & \thirdcell{0.656} & \thirdcell{0.532} \\
+Luminance-GS & 0.362 & 0.536 & \thirdcell{0.411} & 0.372 & 0.532
+& 0.462 & \thirdcell{0.293} & 0.463 & 0.429 \\
+\textbf{Ours} & \thirdcell{0.534} & \bestcell{0.806} & \bestcell{0.647}
+& \bestcell{0.711} & \bestcell{0.740} & \bestcell{0.665}
+& \bestcell{0.482} & \bestcell{0.766} & \bestcell{0.669} \\
+\midrule
+& \multicolumn{9}{c}{LPIPS$\downarrow$} \\
+\cmidrule(lr){2-10}
+3DGS & 0.645 & 0.625 & 0.658 & 0.610 & 0.653 & 0.650 & 0.733
+& 0.683 & 0.657 \\
+AlethNeRF & 0.692 & 0.612 & 0.671 & 0.696 & 0.725 & 0.688 & 0.891
+& 0.646 & 0.703 \\
+I2NeRF & \thirdcell{0.561} & \thirdcell{0.493} & \thirdcell{0.543}
+& \thirdcell{0.486} & \thirdcell{0.544} & \thirdcell{0.488}
+& \thirdcell{0.648} & \bestcell{0.474} & \thirdcell{0.530} \\
+LITA-GS & \secondcell{0.557} & \secondcell{0.326} & \secondcell{0.521}
+& \secondcell{0.435} & \secondcell{0.478} & \secondcell{0.448}
+& \secondcell{0.588} & \thirdcell{0.497} & \secondcell{0.481} \\
+Luminance-GS & 0.779 & 0.534 & 0.737 & 0.614 & 0.766 & 0.625 & 0.655
+& 0.882 & 0.699 \\
+\textbf{Ours} & \bestcell{0.517} & \bestcell{0.303} & \bestcell{0.460}
+& \bestcell{0.392} & \bestcell{0.424} & \bestcell{0.444}
+& \bestcell{0.492} & \secondcell{0.478} & \bestcell{0.439} \\
+\bottomrule
+\end{tabular}%
+}
+\caption{Quantitative comparison with other baseline methods on 8 scenes
+from RealX3D lowlight dataset, including \textit{Chocolate}, \textit{Cupcake}, \textit{GearWorks},
+\textit{Laboratory}, \textit{MilkCookie}, \textit{Popcorn}, \textit{Sculpture}, \textit{Ujikintoki}. We reported three
+rendering metrics (PSNR, SSIM, LPIPS). The first, second and third results
+are highlighted in dark, medium, and light orange, respectively.}
+\label{tab:comparison_main}
+\end{table*}

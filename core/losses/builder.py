@@ -25,6 +25,22 @@ def _cfg_get(cfg, key, default):
         return default
 
 
+def _cfg_has_key(cfg, key):
+    if cfg is None:
+        return False
+    try:
+        getattr(cfg, key)
+        return True
+    except AttributeError:
+        return False
+
+
+def _resolve_weight_map_enabled(loss_cfg, specific_key):
+    if _cfg_has_key(loss_cfg, specific_key):
+        return bool(_cfg_get(loss_cfg, specific_key, False))
+    return bool(_cfg_get(loss_cfg, "RECON_WEIGHT_MAP_ENABLED", False))
+
+
 
 def build_loss_modules(meta_cfg, model_cfg):
     loss_cfg = _cfg_get(meta_cfg, "LOSS", None)
@@ -59,7 +75,7 @@ def build_loss_modules(meta_cfg, model_cfg):
                 start_step=int(_cfg_get(loss_cfg, "RECON_START_STEP", 0)),
                 input_key="recon_hwc",
                 target_key="proxy_target_hwc",
-                use_weight_map=bool(_cfg_get(loss_cfg, "RECON_WEIGHT_MAP_ENABLED", False)),
+                use_weight_map=_resolve_weight_map_enabled(loss_cfg, "RECON_WEIGHT_MAP_Y_ENABLED"),
                 dark_boost=float(_cfg_get(loss_cfg, "RECON_DARK_BOOST", 0.0)),
                 bright_threshold=float(_cfg_get(loss_cfg, "RECON_BRIGHT_THRESHOLD", 0.70)),
                 bright_suppression=float(_cfg_get(loss_cfg, "RECON_BRIGHT_SUPPRESSION", 0.0)),
@@ -74,7 +90,7 @@ def build_loss_modules(meta_cfg, model_cfg):
                 input_key="recon_hwc",
                 target_key="proxy_target_hwc",
                 reference_key=str(_cfg_get(loss_cfg, "CBCR_REFERENCE_KEY", "supervision_hwc")),
-                use_weight_map=bool(_cfg_get(loss_cfg, "RECON_WEIGHT_MAP_ENABLED", False)),
+                use_weight_map=_resolve_weight_map_enabled(loss_cfg, "RECON_WEIGHT_MAP_CBCR_ENABLED"),
                 bright_threshold=float(_cfg_get(loss_cfg, "RECON_BRIGHT_THRESHOLD", 0.70)),
                 bright_suppression=float(_cfg_get(loss_cfg, "RECON_BRIGHT_SUPPRESSION", 0.0)),
                 confidence_floor=float(_cfg_get(loss_cfg, "CBCR_CONFIDENCE_FLOOR", 0.45)),
@@ -86,6 +102,8 @@ def build_loss_modules(meta_cfg, model_cfg):
                 proxy_blend=float(_cfg_get(loss_cfg, "CBCR_PROXY_BLEND", 1.0)),
                 cb_weight=float(_cfg_get(loss_cfg, "CB_WEIGHT", 1.0)),
                 cr_weight=float(_cfg_get(loss_cfg, "CR_WEIGHT", 1.0)),
+                cb_target_bias=float(_cfg_get(loss_cfg, "CB_TARGET_BIAS", 0.0)),
+                cr_target_bias=float(_cfg_get(loss_cfg, "CR_TARGET_BIAS", 0.0)),
             ),
         ]
     )
@@ -135,6 +153,7 @@ def build_loss_modules(meta_cfg, model_cfg):
             SparsePointRegularizationLoss(
                 weight=float(_cfg_get(sparse_cfg, "WEIGHT", 0.0)),
                 start_step=int(_cfg_get(sparse_cfg, "START_STEP", 0)),
+                end_step=_cfg_get(sparse_cfg, "END_STEP", None),
                 sample_points=int(_cfg_get(sparse_cfg, "SAMPLE_POINTS", 1024)),
                 min_opacity=float(_cfg_get(sparse_cfg, "MIN_OPACITY", 0.2)),
                 robust_scale=float(_cfg_get(sparse_cfg, "ROBUST_SCALE", _cfg_get(sparse_cfg, "DISTANCE_CLAMP", 0.05))),
@@ -146,6 +165,71 @@ def build_loss_modules(meta_cfg, model_cfg):
                 density_clamp_max=float(_cfg_get(sparse_cfg, "DENSITY_CLAMP_MAX", 2.0)),
                 quality_error_scale_mode=str(_cfg_get(sparse_cfg, "QUALITY_ERROR_SCALE_MODE", "median")),
                 quality_track_mode=str(_cfg_get(sparse_cfg, "QUALITY_TRACK_MODE", "log_median_norm")),
+                mode=str(_cfg_get(sparse_cfg, "MODE", "point_to_barycenter")),
+                plane_k=int(_cfg_get(sparse_cfg, "PLANE_K", 8)),
+                plane_eps=float(_cfg_get(sparse_cfg, "PLANE_EPS", 1.0e-6)),
+                plane_min_eigen_gap=float(_cfg_get(sparse_cfg, "PLANE_MIN_EIGEN_GAP", 1.0e-4)),
+                tangent_weight=float(_cfg_get(sparse_cfg, "TANGENT_WEIGHT", 0.15)),
+                normal_scale_weight=float(_cfg_get(sparse_cfg, "NORMAL_SCALE_WEIGHT", 0.0)),
+                sampling_mode=str(_cfg_get(sparse_cfg, "SAMPLING_MODE", "random")),
+                hard_ratio=float(_cfg_get(sparse_cfg, "HARD_RATIO", 0.5)),
+                difficulty_score=str(_cfg_get(sparse_cfg, "DIFFICULTY_SCORE", "min_sparse_dist")),
+                random_sample_fallback=bool(_cfg_get(sparse_cfg, "RANDOM_SAMPLE_FALLBACK", True)),
+                global_mining_chunk_size=int(_cfg_get(sparse_cfg, "GLOBAL_MINING_CHUNK_SIZE", 4096)),
+                global_mining_refresh_interval=int(_cfg_get(sparse_cfg, "GLOBAL_MINING_REFRESH_INTERVAL", 25)),
+                reliability_filter_enabled=bool(_cfg_get(sparse_cfg, "RELIABILITY_FILTER_ENABLED", False)),
+                lowlight_brightness_enabled=bool(_cfg_get(sparse_cfg, "LOWLIGHT_BRIGHTNESS_ENABLED", False)),
+                lowlight_gradient_enabled=bool(_cfg_get(sparse_cfg, "LOWLIGHT_GRADIENT_ENABLED", False)),
+                weight_schedule=str(_cfg_get(sparse_cfg, "WEIGHT_SCHEDULE", "constant")),
+                weight_start_scale=float(_cfg_get(sparse_cfg, "WEIGHT_START_SCALE", 1.0)),
+                weight_end_scale=float(_cfg_get(sparse_cfg, "WEIGHT_END_SCALE", 1.0)),
+                weight_decay_end_step=int(_cfg_get(sparse_cfg, "WEIGHT_DECAY_END_STEP", _cfg_get(model_cfg, "TRAIN_TOTAL_STEP", 0))),
+                orientation_enabled=bool(_cfg_get(sparse_cfg, "ORIENTATION_ENABLED", False)),
+                orientation_weight=float(_cfg_get(sparse_cfg, "ORIENTATION_WEIGHT", 0.0)),
+                anisotropic_scale_target_enabled=bool(_cfg_get(sparse_cfg, "ANISOTROPIC_SCALE_TARGET_ENABLED", False)),
+                anisotropic_scale_target_weight=float(_cfg_get(sparse_cfg, "ANISOTROPIC_SCALE_TARGET_WEIGHT", 0.0)),
+                tangent_scale_ratio=float(_cfg_get(sparse_cfg, "TANGENT_SCALE_RATIO", 0.9)),
+                normal_scale_ratio=float(_cfg_get(sparse_cfg, "NORMAL_SCALE_RATIO", 0.24)),
+                target_tangent_scale_min=float(_cfg_get(sparse_cfg, "TARGET_TANGENT_SCALE_MIN", 0.005)),
+                target_tangent_scale_max=float(_cfg_get(sparse_cfg, "TARGET_TANGENT_SCALE_MAX", 0.05)),
+                target_normal_scale_min=float(_cfg_get(sparse_cfg, "TARGET_NORMAL_SCALE_MIN", 0.002)),
+                target_normal_scale_max=float(_cfg_get(sparse_cfg, "TARGET_NORMAL_SCALE_MAX", 0.02)),
+                target_tangent_quantile=float(_cfg_get(sparse_cfg, "TARGET_TANGENT_QUANTILE", 0.75)),
+                target_normal_quantile=float(_cfg_get(sparse_cfg, "TARGET_NORMAL_QUANTILE", 0.75)),
+                target_tangent_std_blend=float(_cfg_get(sparse_cfg, "TARGET_TANGENT_STD_BLEND", 0.75)),
+                target_tangent_std_cap_ratio=float(_cfg_get(sparse_cfg, "TARGET_TANGENT_STD_CAP_RATIO", 1.6)),
+                target_tangent_local_radius_cap_ratio=float(_cfg_get(sparse_cfg, "TARGET_TANGENT_LOCAL_RADIUS_CAP_RATIO", 0.85)),
+                target_tangent_std_floor_ratio=float(_cfg_get(sparse_cfg, "TARGET_TANGENT_STD_FLOOR_RATIO", 1.0)),
+                tail_start_step=_cfg_get(sparse_cfg, "TAIL_START_STEP", _cfg_get(sparse_cfg, "END_STEP", None)),
+                tail_weight_hold_end_step=_cfg_get(sparse_cfg, "TAIL_WEIGHT_HOLD_END_STEP", None),
+                tail_light_mode_enabled=bool(_cfg_get(sparse_cfg, "TAIL_LIGHT_MODE_ENABLED", False)),
+                tail_sampling_mode=_cfg_get(sparse_cfg, "TAIL_SAMPLING_MODE", None),
+                tail_hard_ratio=_cfg_get(sparse_cfg, "TAIL_HARD_RATIO", None),
+                tail_random_sample_fallback=_cfg_get(sparse_cfg, "TAIL_RANDOM_SAMPLE_FALLBACK", None),
+                tail_min_plane_confidence=float(_cfg_get(sparse_cfg, "TAIL_MIN_PLANE_CONFIDENCE", 0.35)),
+                tail_global_mining_refresh_interval=_cfg_get(sparse_cfg, "TAIL_GLOBAL_MINING_REFRESH_INTERVAL", None),
+                tail_candidate_subset_ratio=float(_cfg_get(sparse_cfg, "TAIL_CANDIDATE_SUBSET_RATIO", 1.0)),
+                tail_candidate_subset_min=_cfg_get(sparse_cfg, "TAIL_CANDIDATE_SUBSET_MIN", None),
+                tail_candidate_subset_max=_cfg_get(sparse_cfg, "TAIL_CANDIDATE_SUBSET_MAX", None),
+                tail_stable_sample_ratio_floor=float(_cfg_get(sparse_cfg, "TAIL_STABLE_SAMPLE_RATIO_FLOOR", 0.5)),
+                tail_keep_point_to_plane=bool(_cfg_get(sparse_cfg, "TAIL_KEEP_POINT_TO_PLANE", True)),
+                tail_point_to_plane_no_fallback=bool(_cfg_get(sparse_cfg, "TAIL_POINT_TO_PLANE_NO_FALLBACK", True)),
+                tail_point_to_plane_min_confidence=float(_cfg_get(sparse_cfg, "TAIL_POINT_TO_PLANE_MIN_CONFIDENCE", 0.35)),
+                tail_point_to_plane_confidence_power=float(_cfg_get(sparse_cfg, "TAIL_POINT_TO_PLANE_CONFIDENCE_POWER", 1.0)),
+                tail_point_to_plane_weight_scale=float(_cfg_get(sparse_cfg, "TAIL_POINT_TO_PLANE_WEIGHT_SCALE", 0.2)),
+                tail_keep_orientation=bool(_cfg_get(sparse_cfg, "TAIL_KEEP_ORIENTATION", True)),
+                tail_keep_anisotropic_scale=bool(_cfg_get(sparse_cfg, "TAIL_KEEP_ANISOTROPIC_SCALE", True)),
+                tail_keep_normal_scale=bool(_cfg_get(sparse_cfg, "TAIL_KEEP_NORMAL_SCALE", True)),
+                tail_difficulty_score=str(_cfg_get(sparse_cfg, "TAIL_DIFFICULTY_SCORE", "stable_surface_mixed")),
+                tail_difficulty_distance_weight=float(_cfg_get(sparse_cfg, "TAIL_DIFFICULTY_DISTANCE_WEIGHT", 0.75)),
+                tail_difficulty_orientation_weight=float(_cfg_get(sparse_cfg, "TAIL_DIFFICULTY_ORIENTATION_WEIGHT", 0.75)),
+                tail_difficulty_scale_weight=float(_cfg_get(sparse_cfg, "TAIL_DIFFICULTY_SCALE_WEIGHT", 1.25)),
+                tail_difficulty_normal_weight=float(_cfg_get(sparse_cfg, "TAIL_DIFFICULTY_NORMAL_WEIGHT", 0.5)),
+                tail_difficulty_confidence_weight=float(_cfg_get(sparse_cfg, "TAIL_DIFFICULTY_CONFIDENCE_WEIGHT", 1.0)),
+                difficulty_distance_weight=float(_cfg_get(sparse_cfg, "DIFFICULTY_DISTANCE_WEIGHT", 1.0)),
+                difficulty_orientation_weight=float(_cfg_get(sparse_cfg, "DIFFICULTY_ORIENTATION_WEIGHT", 0.5)),
+                difficulty_scale_weight=float(_cfg_get(sparse_cfg, "DIFFICULTY_SCALE_WEIGHT", 1.0)),
+                difficulty_normal_weight=float(_cfg_get(sparse_cfg, "DIFFICULTY_NORMAL_WEIGHT", 0.5)),
             )
         )
 
@@ -153,9 +237,10 @@ def build_loss_modules(meta_cfg, model_cfg):
 
 
 
-def compute_loss_modules(modules, context):
+def compute_loss_modules(modules, context, return_details=False):
     total_loss = torch.zeros((), device=context["rendered"].device, dtype=context["rendered"].dtype)
     logs = {}
+    details = {} if return_details else None
 
     for module in modules:
         effective_weight = float(module.current_weight(context))
@@ -164,10 +249,21 @@ def compute_loss_modules(modules, context):
         total_loss = total_loss + weighted_loss
         logs[module.name] = float(weighted_loss.detach().item())
         logs[f"{module.name}_weight"] = effective_weight
+        if return_details:
+            details[module.name] = {
+                "raw_loss": raw_loss,
+                "weighted_loss": weighted_loss,
+                "effective_weight": effective_weight,
+            }
         for key, value in extra_logs.items():
-            logs[f"{module.name}_{key}"] = float(value)
+            if isinstance(value, str):
+                logs[f"{module.name}_{key}"] = value
+            else:
+                logs[f"{module.name}_{key}"] = float(value)
 
     logs["total"] = float(total_loss.detach().item())
+    if return_details:
+        return total_loss, logs, details
     return total_loss, logs
 
 

@@ -1,0 +1,75 @@
+\section{Introduction}
+\label{sec:intro}
+
+3D scene reconstruction and novel view synthesis aim to recover
+photorealistic scene representations from multi-view images. Neural Radiance
+Fields (NeRF)~\cite{nerf} demonstrated that implicit radiance-field
+representations can produce high-fidelity view synthesis from posed images,
+while 3D Gaussian Splatting (3DGS)~\cite{kerbl20233d} made this line of
+research more practical for real-time rendering by representing scenes with
+explicit 3D Gaussians. Thanks to its strong reconstruction quality, fast
+rendering speed and scene editability, 3DGS has quickly become a new paradigm
+for scene reconstruction and novel view synthesis~\cite{survey3dgs}.
+
+However, the success of vanilla NeRF and 3DGS still depends heavily on the
+reliability of image supervision. This assumption breaks down severely in
+low-light conditions. Under adverse illumination, image data often suffer
+from severe noise amplification, color distortion, loss of local detail, and
+photometric inconsistency across viewpoints~\cite{liu2025realx3d,zhou2025lita}.
+More importantly, these degradations are not uniformly distributed: some
+regions still preserve usable structure and appearance, while others become
+completely unreliable. Luminance-GS~\cite{cui2025luminance} explicitly points
+out that low-light and exposure variations introduce photometric
+inconsistencies across views for both NeRF- and 3DGS-based pipelines, while
+LITA-GS~\cite{zhou2025lita} further highlights the lack of reliable
+references, severe information loss, and insufficient SfM points under low
+illumination. As a result, low-light 3D reconstruction could be seen as a
+problem of heterogeneous reliability: the supervision signal and the
+available priors are unevenly trustworthy across pixels, regions and
+optimization stages.
+
+Prior work has made important progress toward illumination-robust
+reconstruction. AlethNeRF~\cite{cui2024aleth} introduced concealing fields to
+explain low-light degradation and enabled unsupervised recovery of well-lit
+renderings from dark observations. I2NeRF~\cite{liu2025i2nerf} formulated
+media degradation through a radiative model that unifies emission,
+absorption, and scattering under the Beer-Lambert law. More recently,
+Luminance-GS~\cite{cui2025luminance} adapted 3DGS to challenging lighting
+conditions through per-view color mapping and view-adaptive curve adjustment,
+and LITA-GS~\cite{zhou2025lita} introduced illumination-invariant physical
+priors together with a progressive denoising strategy for reference-free
+3DGS under adverse lighting. These methods significantly improve robustness
+under illumination changes, but they mostly emphasize degradation modeling,
+photometric adaptation, or illumination-invariant representations.
+
+In low-light 3D reconstruction, supervisory cues are not uniformly reliable
+across either image regions or training stages. Motivated by this
+observation, we present Reliability-Aware Staged Low-Light 3DGS decomposing
+the problem into three stages: geometry bootstrap, reliability-aware geometry
+refinement, and geometry-frozen appearance refinement. In the first stage, we build a
+stable scene scaffold with weak depth only used as a conservative trend
+prior~\cite{marigold}. In the second stage, we warm-start from this scaffold
+and continue to reuse sparse geometry from Structure-from-Motion
+(SfM)~\cite{sfm_revisited} during training as quality-aware soft support.
+In the final stage, we freeze geometry and perform geometry-frozen appearance
+refinement, where luminance restoration and chromatic correction are explicitly
+decoupled in YCbCr space to reflect their different reliability in low-light
+images. This design reflects our central claim: low-light 3DGS should not
+treat all supervision equally, but should exploit each cue only when and
+where it is reliable enough to help.
+
+Our contributions can be summarized as follows:
+
+\begin{enumerate}
+    \item We design a reliability-aware pipeline, formulating low-light 3DGS
+    as a reliability-aware optimization problem, where supervisory cues and
+    priors have heterogeneous trustworthiness across regions and stages.
+
+    \item We introduce a density/quality-aware soft sparse anchoring
+    strategy, where fixed-pose COLMAP sparse points are used not only for
+    initialization but also as weak geometric support during refinement.
+
+    \item We propose a decoupled appearance refinement strategy in YCbCr
+    space, where luminance and chroma are supervised by different
+    targets with region confidence awareness.
+\end{enumerate}

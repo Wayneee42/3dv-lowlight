@@ -1,0 +1,119 @@
+\begin{thebibliography}{16}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[Chen and Wang(2024)]{survey3dgs}
+Guikun Chen and Wenguan Wang.
+\newblock A survey on 3d gaussian splatting.
+\newblock \emph{arXiv preprint arXiv:2401.03890}, 2024.
+
+\bibitem[Cui et~al.(2024)Cui, Gu, Sun, Ma, Qiao, and Harada]{cui2024aleth}
+Ziteng Cui, Lin Gu, Xiao Sun, Xianzheng Ma, Yu Qiao, and Tatsuya Harada.
+\newblock Aleth-nerf: Illumination adaptive nerf with concealing field
+  assumption.
+\newblock In \emph{Proceedings of the AAAI Conference on Artificial
+  Intelligence}, pages 1435--1444, 2024.
+
+\bibitem[Cui et~al.(2025)Cui, Chu, and Harada]{cui2025luminance}
+Ziteng Cui, Xuangeng Chu, and Tatsuya Harada.
+\newblock Luminance-gs: Adapting 3d gaussian splatting to challenging lighting
+  conditions with view-adaptive curve adjustment.
+\newblock In \emph{Proceedings of the IEEE/CVF International Conference on
+  Computer Vision}, pages 26472--26482, 2025.
+
+\bibitem[Ke et~al.(2024)Ke, Obukhov, Huang, Metzger, Daudt, and
+  Schindler]{marigold}
+Bingxin Ke, Anton Obukhov, Shengyu Huang, Nando Metzger, Rodrigo~Caye Daudt,
+  and Konrad Schindler.
+\newblock Repurposing diffusion-based image generators for monocular depth
+  estimation.
+\newblock In \emph{Proceedings of the IEEE/CVF Conference on Computer Vision
+  and Pattern Recognition}, pages 9492--9502, 2024.
+
+\bibitem[Kerbl et~al.(2023)Kerbl, Kopanas, Leimk{\"u}hler, and
+  Drettakis]{kerbl20233d}
+Bernhard Kerbl, Georgios Kopanas, Thomas Leimk{\"u}hler, and George Drettakis.
+\newblock 3d gaussian splatting for real-time radiance field rendering.
+\newblock \emph{ACM Transactions on Graphics}, 42\penalty0 (4):\penalty0
+  139--1, 2023.
+
+\bibitem[Liu et~al.(2025{\natexlab{a}})Liu, Bao, Cui, Liu, Chu, Gu, Conde,
+  Umagami, Hashimoto, Hu, et~al.]{liu2025realx3d}
+Shuhong Liu, Chenyu Bao, Ziteng Cui, Yun Liu, Xuangeng Chu, Lin Gu, Marcos~V
+  Conde, Ryo Umagami, Tomohiro Hashimoto, Zijian Hu, et~al.
+\newblock Realx3d: A physically-degraded 3d benchmark for multi-view visual
+  restoration and reconstruction.
+\newblock \emph{arXiv preprint arXiv:2512.23437}, 2025{\natexlab{a}}.
+
+\bibitem[Liu et~al.(2025{\natexlab{b}})Liu, Gu, Cui, Chu, and
+  Harada]{liu2025i2nerf}
+Shuhong Liu, Lin Gu, Ziteng Cui, Xuangeng Chu, and Tatsuya Harada.
+\newblock I2-nerf: Learning neural radiance fields under physically-grounded
+  media interactions.
+\newblock In \emph{Advances in Neural Information Processing Systems
+  (NeurIPS)}, 2025{\natexlab{b}}.
+
+\bibitem[Liu et~al.(2025{\natexlab{c}})Liu, Meng, Lu, Li, Guo, Liu, Liu, and
+  Yang]{glonerf}
+Zongqiang Liu, Qingyao Meng, Daying Lu, Gongzheng Li, Decai Guo, Delong Liu,
+  Chuanxin Liu, and Zongxu Yang.
+\newblock Glonerf: Boosting nerf capabilities and multi-view consistency in
+  low-light environments.
+\newblock \emph{Computers \& Graphics}, 128:\penalty0 104209,
+  2025{\natexlab{c}}.
+
+\bibitem[Ma et~al.(2025)Ma, Zou, Wang, Wang, Xiang, and He]{beyond_darkness}
+Qingsen Ma, Chen Zou, Dianyun Wang, Jia Wang, Liuyu Xiang, and Zhaofeng He.
+\newblock Beyond darkness: Thermal-supervised 3d gaussian splatting for
+  low-light novel view synthesis.
+\newblock \emph{arXiv preprint arXiv:2511.13011}, 2025.
+
+\bibitem[Mildenhall et~al.(2020)Mildenhall, Srinivasan, Tancik, Barron,
+  Ramamoorthi, and Ng]{nerf}
+Ben Mildenhall, Pratul~P. Srinivasan, Matthew Tancik, Jonathan~T. Barron, Ravi
+  Ramamoorthi, and Ren Ng.
+\newblock Nerf: Representing scenes as neural radiance fields for view
+  synthesis.
+\newblock In \emph{European Conference on Computer Vision (ECCV)}, 2020.
+
+\bibitem[Schonberger and Frahm(2016)]{sfm_revisited}
+Johannes~L. Schonberger and Jan-Michael Frahm.
+\newblock Structure-from-motion revisited.
+\newblock In \emph{Proceedings of the IEEE Conference on Computer Vision and
+  Pattern Recognition}, pages 4104--4113, 2016.
+
+\bibitem[Sun et~al.(2025)Sun, Yu, Xu, Zhang, and Zou]{ll_gaussian}
+Hao Sun, Fenggen Yu, Huiyao Xu, Tao Zhang, and Changqing Zou.
+\newblock Ll-gaussian: Low-light scene reconstruction and enhancement via
+  gaussian splatting for novel view synthesis.
+\newblock \emph{arXiv preprint arXiv:2504.10331}, 2025.
+
+\bibitem[Wang et~al.(2023)Wang, Xu, Xu, and Lau]{llnerf}
+Haoyuan Wang, Xiaogang Xu, Ke Xu, and Rynson W.~H. Lau.
+\newblock Lighting up nerf via unsupervised decomposition and enhancement.
+\newblock In \emph{Proceedings of the IEEE/CVF International Conference on
+  Computer Vision}, pages 12632--12641, 2023.
+
+\bibitem[Ye et~al.(2024)Ye, Dong, Hu, Wen, and Liu]{gaussian_dk}
+Sheng Ye, Zhen-Hui Dong, Yubin Hu, Yu-Hui Wen, and Yong-Jin Liu.
+\newblock Gaussian in the dark: Real-time view synthesis from inconsistent dark
+  images using gaussian splatting.
+\newblock \emph{arXiv preprint arXiv:2408.09130}, 2024.
+
+\bibitem[You et~al.(2024)You, Zhang, Zhou, Zhao, and Yao]{lo_gaussian}
+Jingjiao You, Yuanyang Zhang, Tianchen Zhou, Yecheng Zhao, and Li Yao.
+\newblock Lo-gaussian: Gaussian splatting for low-light and overexposure scenes
+  through simulated filter.
+\newblock In \emph{Pacific Graphics}, 2024.
+
+\bibitem[Zhou et~al.(2025)Zhou, Dong, and Chen]{zhou2025lita}
+Han Zhou, Wei Dong, and Jun Chen.
+\newblock Lita-gs: Illumination-agnostic novel view synthesis via
+  reference-free 3d gaussian splatting and physical priors.
+\newblock In \emph{Proceedings of the IEEE/CVF International Conference on
+  Computer Vision}, pages 21580--21589, 2025.
+
+\end{thebibliography}

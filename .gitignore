@@ -1,4 +1,7 @@
 # Custum
+/dataset/
+/lowlight/
+/outputs/
 **/*.pkl
 **/*.pt
 **/*.pth

@@ -1,0 +1,144 @@
+低照相关方向已经有很多文章，如Gaussian-DK 用 camera response module 处理暗光下的 multi-view inconsistency；Luminance-GS 用 per-view color matrix + adaptive curve adjustment；LITA-GS 主打 illumination-invariant physical prior 和 structure rendering；LL-Gaussian 则把 dense/MVS initialization、decomposition、diffusion prior 放到一个统一框架里。要如何叙事才能有说服力呢？
+
+
+有说服力的叙事，不该硬和这些方法比“模块更大更全”，而该把你的方法讲成：
+
+在低照 3DGS 里，关键不是堆更强先验，而是判断“哪个信号在什么阶段可信”。
+
+这比讲“我也有一个 illumination head / 一个 prior / 一个 calibration”更强。
+
+建议主叙事
+现有方法大致分两类：
+
+一类强调更强的光度建模，如 camera response、per-view color transform、curve adjustment
+一类强调更强的先验融合，如 dense/MVS init、decomposition、diffusion prior、physical prior
+你的切入点不要说“我比它们都强”，而是说：
+
+低照场景的真正问题是 supervision 和 prior 的可靠性高度不均匀。错误不是因为模块不够复杂，而是因为不可靠信号被过早、过强地注入到了优化过程中。
+
+然后顺着这个核心 insight 展开。
+
+你现在最适合的定位
+可以把方法概括成：
+
+Reliability-Aware Staged Low-Light 3DGS
+
+三个核心点就够了：
+
+Geometry reliability first
+
+单目深度是稠密的，但在低照下并不稳定。
+多视图 COLMAP sparse 虽然稀疏，但更可信。
+所以你不用强 dense depth init，而是用 fixed-pose COLMAP sparse 做初始化，并在 Stage 5 继续作为 weak sparse-guided anchor。
+Stage-wise optimization instead of one-shot fusion
+
+低照几何和外观不能一起猛训。
+先建几何，再 refine 几何，最后单独做 appearance。
+这和很多“统一大框架”正好形成区别：你强调的是 optimization scheduling，不是模块堆叠。
+Luminance-chroma reliability decoupling
+
+proxy target 对亮度通常比对颜色更可信。
+所以在 Stage 6 里：
+Y 由 calibrated proxy 监督
+Cb/Cr 用更保守的 chroma branch 单独处理
+这不是普通 relighting head，而是“亮度与色彩的可信度解耦”。
+和已有工作的对比要怎么写
+不要逐篇硬比模块，按“方法哲学”分组更自然：
+
+对 Gaussian-DK / Luminance-GS：
+
+它们主要解决 low-light 下的 photometric inconsistency
+你则强调 geometry/appearance cues have different reliability across stages
+你的重点不是更强 per-view photometric transform，而是更稳的 staged optimization
+对 LITA-GS / LL-Gaussian：
+
+它们是 strong-prior / unified-framework 路线
+你则是 selective-prior / weak-but-trustworthy-prior 路线
+你的卖点不是“先验更多”，而是“先验更克制，只在可信的时候用”
+最值得写成贡献的两点
+实话说，最像方法贡献的是这两条：
+
+Fixed-pose COLMAP sparse from initialization to training-time weak geometry anchoring
+Decoupled YCbCr appearance refinement with Y-only illumination and conservative chroma supervision
+而三阶段本身更像承载这两点的训练框架。
+
+一句很适合放摘要/引言里的话
+可以直接写成这种风格：
+
+Existing low-light 3DGS methods often improve performance by introducing stronger photometric modeling or heavier priors. In contrast, we observe that the main challenge in low-light scene relighting is not the absence of complex modules, but the uneven reliability of different supervisory cues. This motivates a reliability-aware staged pipeline: reliable sparse multi-view geometry is used to bootstrap and weakly anchor geometry, while luminance and chroma are decoupled in the final appearance refinement stage.
+
+一句更短的中文版本
+
+我们认为低照 3DGS 的关键问题不是“模块不够强”，而是“不同监督信号的可信度不同且阶段性不同”。因此方法核心不是统一大框架，而是可靠性驱动的 staged optimization。
+
+不要重点强调的
+这些不适合当主叙事：
+
+“我们也有 calibration / illumination / prior”
+“我们也试过 color checker / canonical calib / merged stage45”
+“我们做了很多工程调参”
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+点级可靠性
+sparse point 不是等质的
+通过 track_len / reproj_error / local density 做 quality/density-aware weighting
+区域级可靠性
+proxy_target 不是全图同权可信
+暗区通过 shadow_proxy 走更积极的恢复路径
+ChromaReconstructionLoss 里又用 bright suppression / alpha confidence / structure confidence / proxy_shadow_weight 构造色彩权重图
+阶段级可靠性
+不同信号在不同阶段可信度不同
+所以才要 stage4 -> stage5 -> stage6
+所以更好的写法不是：
+
+“我们的方法是一个 staged pipeline”
+而是：
+
+“我们的方法是一个 reliability-aware pipeline，而 staged optimization 只是把这种可靠性建模落到训练流程上的实现方式。”
+更具体地说，可以把方法主线改成这三个层次：
+
+1. Reliable geometry support
+
+fixed-pose COLMAP sparse initialization
+sparse-guided regularization with sparse quality/density-aware weighting
+2. Region-aware appearance supervision
+
+adaptive proxy-target calibration
+shadow-aware proxy blending
+confidence-aware chroma weighting
+3. Staged optimization
+
+Stage 4: geometry bootstrap with the most reliable geometric signals
+Stage 5: weak geometry refinement with sparse support and structure
+Stage 6: appearance-only refinement with luminance-chroma decoupling
+也就是：
+
+点级：哪个 sparse point 更可信
+区域级：图像哪些区域更可信
+阶段级：哪些信号在哪个阶段更可信

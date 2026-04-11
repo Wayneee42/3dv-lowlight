@@ -97,5 +97,7 @@ PRIORS:
 EXPERIMENT:
   STAGE: 'stage4_tuned_colmap'
 
-
+EVAL:
+  EXPORT_TRAIN_VIEWS: true
+  TRAIN_RENDER_DIR: train_render
 

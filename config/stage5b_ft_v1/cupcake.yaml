@@ -1,6 +1,6 @@
 ﻿DATASET:
-  NAME: 'GearWorks'
-  DATA_PATH: 'dataset/Development/lowlight_development/development/GearWorks'
+  NAME: 'Cupcake'
+  DATA_PATH: 'dataset/Development/lowlight_development/development/Cupcake'
   BACKGROUND_COLOR: 255.0
   AUXILIARY_DIR: 'auxiliaries'
 
@@ -29,7 +29,7 @@ MODEL:
   SCENE_SCALE: 2.0
   TRAIN_TOTAL_STEP: 5000
   VAL_INTERVAL_STEP: 1000
-  LOG_INTERVAL_STEP: 100
+  LOG_INTERVAL_STEP: 500
   SH_UPGRADE_INTERVAL: 1000
   CHECKPOINT_STEPS: [2000, 3000, 5000]
   LR_MEANS: 8.0e-5
@@ -39,7 +39,7 @@ MODEL:
   LR_OPACITIES: 2.5e-2
   LR_SH0: 2.5e-3
   LR_SHN: 1.25e-4
-  WARMSTART_CHECKPOINT: 'outputs/stage4_tuned_colmap/GearWorks/step_15000/step_15000.pt'
+  WARMSTART_CHECKPOINT: 'outputs/stage4_tuned_colmap/Cupcake/step_15000/step_15000.pt'
   DENSIFY_START_STEP: 6000
   DENSIFY_STOP_STEP: 6000
   DENSIFY_INTERVAL: 200
@@ -65,7 +65,7 @@ LOSS:
 PRIORS:
   DEPTH:
     ENABLED: true
-    WEIGHT: 0.02
+    WEIGHT: 0.01
     GLOBAL_WEIGHT: 1.0
     LOCAL_WEIGHT: 1.0
     BOX_SIZE: 128
@@ -89,9 +89,9 @@ PRIORS:
     EPS: 1.0e-4
   SPARSE:
     ENABLED: true
-    WEIGHT: 0.002
+    WEIGHT: 0.1
     START_STEP: 0
-    SAMPLE_POINTS: 1024
+    SAMPLE_POINTS: 4096
     MIN_OPACITY: 0.2
     ROBUST_SCALE: 0.05
     KNN_K: 3
@@ -102,8 +102,22 @@ PRIORS:
     DENSITY_CLAMP_MAX: 2.0
     QUALITY_ERROR_SCALE_MODE: 'median'
     QUALITY_TRACK_MODE: 'log_median_norm'
+    SAMPLING_MODE: 'hardest_mixed'
+    HARD_RATIO: 0.5
+    DIFFICULTY_SCORE: 'min_sparse_dist'
+    RANDOM_SAMPLE_FALLBACK: true
+    WEIGHT_SCHEDULE: 'decay'
+    WEIGHT_START_SCALE: 2.0
+    WEIGHT_END_SCALE: 0.25
+    WEIGHT_DECAY_END_STEP: 5000
 EXPERIMENT:
-  STAGE: 'stage5b_ft'
+  STAGE: 'stage5b_ft_v1'
+
+EVAL:
+  EXPORT_TRAIN_VIEWS: true
+  TRAIN_RENDER_DIR: train_render
+
+
 
 
 

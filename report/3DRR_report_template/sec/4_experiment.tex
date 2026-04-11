@@ -1,0 +1,116 @@
+\section{Experiment}
+\label{subsec:experiment}
+
+\paragraph*{Dataset}
+We evaluate our method on the RealX3D low-light benchmark dataset~\cite{liu2025realx3d}.
+RealX3D contains nine real-world scenes captured under low-light conditions,
+which features complex scene geometry, denser multi-view capture, wider viewpoint
+diversity, and spatially non-uniform light setup. Since the BlueHawaii scene was
+used as the validation scene in the 3DRR challenge, we follow this protocol and
+conduct all comparisons on the remaining eight scenes. For each scene, the
+training set provides 27--32 low-light sRGB images together with the corresponding
+calibrated camera poses, and the task is to synthesize 5--6 novel-view
+images under normal illumination.
+
+\paragraph*{Comparison Methods}
+We compare our method with representative low-light 3D reconstruction approaches
+that operate directly on sRGB inputs, including vanilla 3DGS~\cite{kerbl20233d},
+AlethNeRF~\cite{cui2024aleth}, I2NeRF~\cite{liu2025i2nerf}, LITA-GS~\cite{zhou2025lita},
+and Luminance-GS~\cite{cui2025luminance}, as summarized in Table~\ref{tab:comparison_main}. These
+baselines cover both NeRF-based methods (AlethNeRF and I2NeRF) and 3DGS-based
+methods (vanilla 3DGS, LITA-GS, and Luminance-GS). For fair comparison, neither
+our method nor the compared methods relies on separate pre-processing exposure
+enhancement or post-processing image restoration modules.
+
+\paragraph*{Implementation Details}
+We extract monocular depth, offline structure priors, and fixed-pose COLMAP sparse
+points for each scene, and use the same Simple3DGS backbone with spherical harmonics
+of degree 3 in all stages. Low-light training images are converted into enhanced
+supervision on the fly, while Stage 3 additionally uses an adaptive proxy target.
+Experiments were conducted on a cloud-hosted NVIDIA GPU with 32 GB VRAM.
+
+\input{sec/scene_comparison_table}
+
+Our final pipeline contains three stages. The first stage 
+runs for 15K iterations, initializes Gaussians from the filtered COLMAP sparse cloud
+plus 5000 random points, and is the only stage with densification. The second stage
+runs for 5K iterations without densification and enables
+sparse-guided regularization with 4096 sampled active Gaussians, $K{=}3$, and weight
+$0.1$. The final stage also
+runs for 5K iterations, warm-starts from the geometry base, freezes the main geometry, and
+performs YCbCr-space appearance refinement with $\lambda_Y{=}0.5$,
+$\lambda_{CbCr}{=}0.16$, $\lambda_{chr}{=}5{\times}10^{-4}$, and both luminance and
+chroma weight maps enabled.
+
+\paragraph*{Experimental Results}
+We compare our method with 3DGS, AlethNeRF, I2NeRF, LITA-GS, and
+Luminance-GS on the eight evaluation scenes excluding BlueHawaii.
+Table~\ref{tab:comparison_main} reports PSNR, SSIM, and LPIPS. Our method achieves the
+best average performance on all three metrics, reaching 17.88 PSNR, 0.669
+SSIM, and 0.439 LPIPS. It ranks first on 6 out of 8 scenes in PSNR, 7 out
+of 8 scenes in SSIM, and 7 out of 8 scenes in LPIPS. Compared with the
+strongest 3DGS-based baseline, LITA-GS, our final model improves the scene
+average by 2.52 dB in PSNR and reduces LPIPS from 0.481 to 0.439. The gains
+are particularly clear on challenging scenes such as \textit{GearWorks}, \textit{Laboratory},
+and \textit{Sculpture}, where reliable geometry and decoupled appearance refinement
+are both important. 
+
+Figure~\ref{fig:qualitative_results} shows representative visual comparisons
+on five scenes. Existing methods often suffer from unstable enhancement,
+severe texture loss, or distorted color restoration under severe low-light
+conditions. NeRF-based methods, like AlethNeRF and I2NeRF, produce messy
+results with excessive scene noise and chaotic colors when given extremely
+dark input images. Luminance-GS tends to over-enhance low-light scenes,
+leading to haze-like appearance renderings and noticeable loss of contrast
+rather than natural brightness recovery. LITA-GS exhibits strong sensitivity
+to varying scenes. Specifically, it leads to excessive enhancement of brightness
+and contrast in certain scenarios, such as \textit{Popcorn} and
+\textit{Chocolate}, while in other scenarios like \textit{GearWorks}, it
+suffers from insufficient enhancement and texture loss. In contrast, our
+method consistently produces clearer scene boundaries, more plausible
+brightness, and more natural color appearance, avoiding the strong color cast
+or washed-out appearance observed in several baselines. The improvements are
+especially visible in the cluttered \textit{Chocolate}, \textit{Laboratory}
+and \textit{Popcorn} scenes and in the geometry-sensitive \textit{Sculpture}
+scene, where our results preserve fine structures.
+
+\paragraph*{Ablation Study}
+Table~\ref{tab:stage_ablation} shows a clear separation between the roles of
+the three stages. Stage~1 already gives a reasonable starting point, while
+adding Stage~2 changes the image metrics only slightly on average
+(14.74$\rightarrow$14.84 PSNR, 0.598$\rightarrow$0.599 SSIM, and
+0.465$\rightarrow$0.463 LPIPS). This behavior is consistent with the goal of
+Stage~2: it mainly stabilizes geometry under no-densify refinement instead of
+directly optimizing perceptual appearance. The major improvement appears after
+Stage~3, where the average performance rises to 17.88 PSNR, 0.669 SSIM, and
+0.439 LPIPS, with gains on all scenes. This indicates that once geometry is
+sufficiently stabilized, the remaining bottleneck lies in appearance refinement
+under low-light conditions, which is effectively handled by the geometry-frozen
+decoupled refinement stage.
+
+\input{sec/stage_ablation_table}
+
+The effect of sparse-guided regularization is better reflected by
+geometry-oriented metrics than by image metrics. As shown in
+Table~\ref{tab:sparse_geometry_ablation}, enabling this term consistently
+reduces both the average support distance and the Chamfer-like mean, while
+improving G$\rightarrow$S Coverage@0.10. Although the absolute gains are
+modest, they are consistent across all three measures, suggesting that the
+module works as intended: it gently pulls active Gaussians toward more
+reliable sparse support without destabilizing the rendering optimization.
+
+\input{sec/sparse_geometry_ablation_table}
+
+Table~\ref{tab:stage3_weightmap_ablation} evaluates the key components of the
+final appearance refinement stage. The full model performs best overall.
+Removing the CbCr weight map leads to a small but consistent degradation,
+showing that branch-specific chroma weighting is helpful but not the dominant
+factor. In contrast, removing the Y weight map causes a clearly larger drop,
+especially in PSNR (17.88$\rightarrow$17.64), indicating that luminance-aware
+reweighting contributes more directly to restoring low-light visibility. The
+largest degradation comes from removing the chroma residual branch, which
+reduces performance to 17.27 PSNR, 0.6486 SSIM, and 0.4505 LPIPS. This result
+shows that brightness correction alone is insufficient: explicit chroma
+adjustment is still necessary to suppress color cast and recover natural
+appearance.
+\input{sec/stage3_ablation_table}
