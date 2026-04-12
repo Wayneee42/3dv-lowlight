@@ -123,15 +123,18 @@ def summarize_topology_records(records, final_num_gaussians):
     event_count = len(records)
     total_spawn = sum(int(record.get("spawn_count", 0)) for record in records)
     total_prune = sum(int(record.get("prune_count", 0)) for record in records)
+    total_prune_decayed = sum(int(record.get("prune_decayed_count", 0)) for record in records)
     mean_hole_ratio = sum(float(record.get("coverage_hole_ratio", 0.0)) for record in records) / event_count
     return {
         "record_type": "topology_summary",
         "num_events": int(event_count),
         "total_spawn_count": int(total_spawn),
         "total_prune_count": int(total_prune),
+        "total_prune_decayed_count": int(total_prune_decayed),
         "mean_spawn_count": float(total_spawn / max(1, event_count)),
         "mean_prune_count": float(total_prune / max(1, event_count)),
         "mean_coverage_hole_ratio": float(mean_hole_ratio),
+        "mean_prune_sparse_core_ratio": float(sum(float(record.get("prune_sparse_core_ratio", 0.0)) for record in records) / event_count),
         "final_num_gaussians": int(final_num_gaussians),
     }
 
@@ -904,6 +907,72 @@ def compute_vsurface_topology_metrics(
         }
 
 
+def build_prune_reliable_core(
+    sparse_points,
+    sparse_track_len,
+    sparse_reproj_error,
+    sparse_brightness_score,
+    sparse_gradient_score,
+    topology_cfg,
+    sparse_cfg,
+    sparse_module,
+):
+    num_sparse = 0 if sparse_points is None else int(sparse_points.shape[0])
+    support_quantile = float(min(max(_cfg_get(topology_cfg, "PRUNE_CORE_SUPPORT_QUANTILE", 0.7), 0.0), 1.0))
+    info = {
+        "enabled": int(bool(_cfg_get(topology_cfg, "PRUNE_RELIABLE_CORE_ENABLED", False))),
+        "rule": str(_cfg_get(topology_cfg, "PRUNE_RELIABLE_CORE_RULE", "support_quantile")).lower(),
+        "core_count": int(num_sparse),
+        "core_ratio": float(1.0 if num_sparse > 0 else 0.0),
+        "core_support_mean": 0.0,
+        "support_quantile": support_quantile,
+    }
+    if num_sparse == 0:
+        return sparse_points, sparse_track_len, sparse_reproj_error, sparse_brightness_score, sparse_gradient_score, info
+
+    if sparse_module is None or not bool(info["enabled"]) or info["rule"] != "support_quantile":
+        return sparse_points, sparse_track_len, sparse_reproj_error, sparse_brightness_score, sparse_gradient_score, info
+
+    with torch.no_grad():
+        _, _, _, _, support_score = sparse_module._get_sparse_support_scores(
+            sparse_points,
+            sparse_track_len,
+            sparse_reproj_error,
+            sparse_brightness_score,
+            sparse_gradient_score,
+        )
+        min_core_points = int(
+            max(
+                _cfg_get(topology_cfg, "PRUNE_CORE_MIN_POINTS", 256),
+                _cfg_get(sparse_cfg, "KNN_K", 3),
+                _cfg_get(sparse_cfg, "PLANE_K", 8),
+            )
+        )
+        min_core_points = max(1, min(int(num_sparse), min_core_points))
+        if int(num_sparse) <= min_core_points:
+            core_mask = torch.ones((num_sparse,), device=sparse_points.device, dtype=torch.bool)
+        else:
+            support_threshold = torch.quantile(support_score, support_quantile)
+            core_mask = support_score >= support_threshold
+            if int(core_mask.sum().item()) < min_core_points:
+                topk = torch.topk(support_score, k=min_core_points, largest=True).indices
+                core_mask = torch.zeros((num_sparse,), device=sparse_points.device, dtype=torch.bool)
+                core_mask[topk] = True
+        core_count = int(core_mask.sum().item())
+        core_support = support_score[core_mask]
+        info["core_count"] = core_count
+        info["core_ratio"] = float(core_count / max(1, num_sparse))
+        info["core_support_mean"] = float(core_support.mean().item()) if int(core_support.numel()) > 0 else 0.0
+        return (
+            sparse_points[core_mask],
+            sparse_track_len[core_mask] if sparse_track_len is not None else sparse_track_len,
+            sparse_reproj_error[core_mask] if sparse_reproj_error is not None else sparse_reproj_error,
+            sparse_brightness_score[core_mask] if sparse_brightness_score is not None else sparse_brightness_score,
+            sparse_gradient_score[core_mask] if sparse_gradient_score is not None else sparse_gradient_score,
+            info,
+        )
+
+
 def run_sparse_topology_event(
     model,
     sparse_points,
@@ -937,6 +1006,10 @@ def run_sparse_topology_event(
         "num_gaussians_after": int(model.num_gaussians),
         "prune_mode": str(_cfg_get(topology_cfg, "PRUNE_MODE", "hard_remove")),
         "prune_active": 0,
+        "prune_decayed_count": 0,
+        "prune_sparse_core_count": 0,
+        "prune_sparse_core_ratio": 0.0,
+        "prune_sparse_core_support_mean": 0.0,
         "spawn_feature_init_mode": str(_cfg_get(topology_cfg, "SEED_FEATURE_INIT", "nearest_gaussian_copy")),
         "surface_coupling_active": 0,
         "spawn_surface_score_mean": 0.0,
@@ -971,7 +1044,8 @@ def run_sparse_topology_event(
     prune_surface_score_weight = float(max(0.0, _cfg_get(topology_cfg, "PRUNE_SURFACE_SCORE_WEIGHT", 1.0)))
     surface_score_normal_weight = float(max(0.0, _cfg_get(topology_cfg, "SURFACE_SCORE_NORMAL_WEIGHT", 0.5)))
     surface_score_scale_weight = float(max(0.0, _cfg_get(topology_cfg, "SURFACE_SCORE_SCALE_WEIGHT", 2.0)))
-    sparse_surface_module = find_sparse_guided_module(loss_modules) if surface_coupling_enabled else None
+    sparse_guided_module = find_sparse_guided_module(loss_modules)
+    sparse_surface_module = sparse_guided_module if surface_coupling_enabled else None
     event_info["surface_coupling_active"] = int(
         sparse_surface_module is not None and (spawn_surface_score_weight > 0.0 or prune_surface_score_weight > 0.0)
     )
@@ -1091,12 +1165,32 @@ def run_sparse_topology_event(
     prune_mode = str(_cfg_get(topology_cfg, "PRUNE_MODE", "hard_remove")).lower()
     prune_indices = torch.zeros((0,), device=device, dtype=torch.long)
     if prune_enabled:
+        (
+            prune_sparse_points,
+            prune_sparse_track_len,
+            prune_sparse_reproj_error,
+            prune_sparse_brightness_score,
+            prune_sparse_gradient_score,
+            prune_core_info,
+        ) = build_prune_reliable_core(
+            sparse_points=sparse_points,
+            sparse_track_len=sparse_track_len,
+            sparse_reproj_error=sparse_reproj_error,
+            sparse_brightness_score=sparse_brightness_score,
+            sparse_gradient_score=sparse_gradient_score,
+            topology_cfg=topology_cfg,
+            sparse_cfg=sparse_cfg,
+            sparse_module=sparse_guided_module,
+        )
+        event_info["prune_sparse_core_count"] = int(prune_core_info.get("core_count", 0))
+        event_info["prune_sparse_core_ratio"] = float(prune_core_info.get("core_ratio", 0.0))
+        event_info["prune_sparse_core_support_mean"] = float(prune_core_info.get("core_support_mean", 0.0))
         prune_opacity_thresh = float(min(max(_cfg_get(topology_cfg, "PRUNE_OPACITY_THRESH", 0.08), 0.0), 1.0))
         prune_distance_thresh = float(max(_cfg_get(topology_cfg, "PRUNE_DISTANCE_THRESH", 0.12), 0.0))
         candidate_indices = torch.nonzero(opacity_values < prune_opacity_thresh, as_tuple=False).squeeze(-1)
         if int(candidate_indices.numel()) > 0:
             candidate_means = means[candidate_indices]
-            candidate_sparse_dist, _ = chunked_nearest_neighbors(candidate_means, sparse_points, distance_chunk)
+            candidate_sparse_dist, _ = chunked_nearest_neighbors(candidate_means, prune_sparse_points, distance_chunk)
             far_mask = candidate_sparse_dist > prune_distance_thresh
             if spawn_count > 0:
                 candidate_spawn_dist, _ = chunked_nearest_neighbors(candidate_means, spawn_points, distance_chunk)
@@ -1116,11 +1210,11 @@ def run_sparse_topology_event(
                             sparse_module=sparse_surface_module,
                             query_points=means[prune_candidates],
                             gaussian_indices=prune_candidates,
-                            sparse_points=sparse_points,
-                            sparse_track_len=sparse_track_len,
-                            sparse_reproj_error=sparse_reproj_error,
-                            sparse_brightness_score=sparse_brightness_score,
-                            sparse_gradient_score=sparse_gradient_score,
+                            sparse_points=prune_sparse_points,
+                            sparse_track_len=prune_sparse_track_len,
+                            sparse_reproj_error=prune_sparse_reproj_error,
+                            sparse_brightness_score=prune_sparse_brightness_score,
+                            sparse_gradient_score=prune_sparse_gradient_score,
                             normal_score_weight=surface_score_normal_weight,
                             scale_score_weight=surface_score_scale_weight,
                         )
@@ -1136,6 +1230,7 @@ def run_sparse_topology_event(
     event_info["prune_count"] = int(prune_indices.numel())
 
     if prune_mode == "opacity_decay" and int(prune_indices.numel()) > 0:
+        decayed_count = int(prune_indices.numel())
         decay_value = float(max(_cfg_get(topology_cfg, "PRUNE_OPACITY_DECAY", 0.5), 0.0))
         with torch.no_grad():
             current_opacity = torch.sigmoid(model.splats["opacities"].data[prune_indices])
@@ -1146,6 +1241,7 @@ def run_sparse_topology_event(
                 module.reset_runtime_cache()
         prune_indices = torch.zeros((0,), device=device, dtype=torch.long)
         event_info["prune_mode"] = "opacity_decay"
+        event_info["prune_decayed_count"] = decayed_count
 
     keep_mask = torch.ones((int(model.num_gaussians),), device=device, dtype=torch.bool)
     if int(prune_indices.numel()) > 0:
@@ -1389,6 +1485,12 @@ def train(config_path, device="cuda"):
                 "topology_prune_start_step": int(_cfg_get(topology_cfg, "PRUNE_START_STEP", _cfg_get(topology_cfg, "START_STEP", 0))) if topology_enabled else 0,
                 "topology_max_spawn_per_event": int(_cfg_get(topology_cfg, "MAX_SPAWN_PER_EVENT", 0)) if topology_enabled else 0,
                 "topology_max_prune_ratio_per_event": float(_cfg_get(topology_cfg, "MAX_PRUNE_RATIO_PER_EVENT", 0.0)) if topology_enabled else 0.0,
+                "topology_prune_mode": str(_cfg_get(topology_cfg, "PRUNE_MODE", "hard_remove")) if topology_enabled else "disabled",
+                "topology_prune_opacity_decay": float(_cfg_get(topology_cfg, "PRUNE_OPACITY_DECAY", 0.5)) if topology_enabled else 0.0,
+                "topology_prune_reliable_core_enabled": int(bool(_cfg_get(topology_cfg, "PRUNE_RELIABLE_CORE_ENABLED", False))) if topology_enabled else 0,
+                "topology_prune_reliable_core_rule": str(_cfg_get(topology_cfg, "PRUNE_RELIABLE_CORE_RULE", "support_quantile")) if topology_enabled else "disabled",
+                "topology_prune_core_support_quantile": float(_cfg_get(topology_cfg, "PRUNE_CORE_SUPPORT_QUANTILE", 0.7)) if topology_enabled else 0.0,
+                "topology_prune_core_min_points": int(_cfg_get(topology_cfg, "PRUNE_CORE_MIN_POINTS", 0)) if topology_enabled else 0,
                 "adaptive_coverage_enabled": int(bool(_cfg_get(topology_cfg, "ADAPTIVE_COVERAGE_ENABLED", True))) if topology_enabled else 0,
                 "coverage_radius_density_scale": float(_cfg_get(topology_cfg, "COVERAGE_RADIUS_DENSITY_SCALE", 2.0)) if topology_enabled else 0.0,
                 "coverage_radius_min_scale": float(_cfg_get(topology_cfg, "COVERAGE_RADIUS_MIN_SCALE", 0.5)) if topology_enabled else 0.0,
@@ -1516,6 +1618,10 @@ def train(config_path, device="cuda"):
             "num_gaussians_after": int(model.num_gaussians),
             "prune_mode": str(_cfg_get(topology_cfg, "PRUNE_MODE", "hard_remove")) if topology_enabled else "disabled",
             "prune_active": 0,
+            "prune_decayed_count": 0,
+            "prune_sparse_core_count": 0,
+            "prune_sparse_core_ratio": 0.0,
+            "prune_sparse_core_support_mean": 0.0,
             "spawn_feature_init_mode": str(_cfg_get(topology_cfg, "SEED_FEATURE_INIT", "nearest_gaussian_copy")) if topology_enabled else "disabled",
             "surface_coupling_active": 0,
             "spawn_surface_score_mean": 0.0,
@@ -1672,6 +1778,10 @@ def train(config_path, device="cuda"):
                 "num_gaussians_after": int(topology_record.get("num_gaussians_after", model.num_gaussians)),
                 "prune_mode": str(topology_record.get("prune_mode", topology_event_info["prune_mode"])),
                 "prune_active": int(topology_record.get("prune_active", topology_event_info["prune_active"])),
+                "prune_decayed_count": int(topology_record.get("prune_decayed_count", topology_event_info["prune_decayed_count"])),
+                "prune_sparse_core_count": int(topology_record.get("prune_sparse_core_count", topology_event_info["prune_sparse_core_count"])),
+                "prune_sparse_core_ratio": float(topology_record.get("prune_sparse_core_ratio", topology_event_info["prune_sparse_core_ratio"])),
+                "prune_sparse_core_support_mean": float(topology_record.get("prune_sparse_core_support_mean", topology_event_info["prune_sparse_core_support_mean"])),
                 "spawn_feature_init_mode": str(topology_record.get("spawn_feature_init_mode", topology_event_info["spawn_feature_init_mode"])),
                 "surface_coupling_active": int(topology_record.get("surface_coupling_active", topology_event_info["surface_coupling_active"])),
                 "spawn_surface_score_mean": float(topology_record.get("spawn_surface_score_mean", topology_event_info["spawn_surface_score_mean"])),
