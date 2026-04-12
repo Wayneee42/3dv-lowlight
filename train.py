@@ -618,6 +618,130 @@ def build_optimizers_and_schedulers(model, cfg, lr_map, frozen_geometry_keys, to
     return optimizers, schedulers
 
 
+def initialize_gaussian_runtime_state(model):
+    device = model.splats["opacities"].device
+    opacity_values = torch.sigmoid(model.splats["opacities"].detach().reshape(-1))
+    return {
+        "gaussian_birth_step": torch.full((int(opacity_values.numel()),), -1, device=device, dtype=torch.long),
+        "gaussian_visible_ema": opacity_values.detach().clone(),
+        "gaussian_alpha_ema": opacity_values.detach().clone(),
+        "gaussian_render_confidence": opacity_values.detach().clone(),
+    }
+
+
+def mutate_gaussian_runtime_state(runtime_state, keep_mask=None, append_count=0, current_step=0, device=None):
+    if runtime_state is None:
+        return
+    append_count = int(max(0, append_count))
+    for key, values in runtime_state.items():
+        updated = values
+        if keep_mask is not None and int(values.shape[0]) == int(keep_mask.shape[0]):
+            updated = updated[keep_mask]
+        if append_count > 0:
+            target_device = updated.device if device is None else device
+            if key == "gaussian_birth_step":
+                append_values = torch.full((append_count,), int(current_step), device=target_device, dtype=torch.long)
+            else:
+                append_values = torch.zeros((append_count,), device=target_device, dtype=updated.dtype)
+            updated = torch.cat([updated, append_values], dim=0)
+        runtime_state[key] = updated
+
+
+def _reduce_render_info_signal(values, num_gaussians):
+    if values is None or not torch.is_tensor(values):
+        return None
+    reduced = values.detach()
+    if int(reduced.numel()) == 0:
+        return None
+    if int(reduced.numel()) == int(num_gaussians):
+        return reduced.reshape(-1)
+    if reduced.ndim >= 2 and int(reduced.shape[-1]) == int(num_gaussians):
+        return reduced.reshape(-1, int(num_gaussians)).amax(dim=0)
+    if reduced.ndim >= 2 and int(reduced.shape[0]) == int(num_gaussians):
+        return reduced.reshape(int(num_gaussians), -1).amax(dim=1)
+    return None
+
+
+def _mask_from_render_info_ids(values, num_gaussians, device):
+    if values is None or not torch.is_tensor(values):
+        return None
+    ids = values.detach().reshape(-1).to(device=device)
+    if int(ids.numel()) == 0:
+        return None
+    ids = ids.long()
+    valid = (ids >= 0) & (ids < int(num_gaussians))
+    if not bool(valid.any().item()):
+        return None
+    mask = torch.zeros((int(num_gaussians),), device=device, dtype=torch.float32)
+    mask[ids[valid].unique()] = 1.0
+    return mask
+
+
+def extract_gaussian_render_signals(render_info, num_gaussians, opacity_values):
+    device = opacity_values.device
+    if not isinstance(render_info, dict) or int(num_gaussians) <= 0:
+        return None, None
+
+    visible_signal = None
+    for key in ("gaussian_ids", "flatten_ids", "visible_ids"):
+        visible_signal = _mask_from_render_info_ids(render_info.get(key), num_gaussians, device)
+        if visible_signal is not None:
+            break
+
+    if visible_signal is None:
+        radii = _reduce_render_info_signal(render_info.get("radii"), num_gaussians)
+        if radii is not None:
+            visible_signal = (radii.to(device=device, dtype=opacity_values.dtype) > 0).to(dtype=opacity_values.dtype)
+
+    if visible_signal is None:
+        tiles_per_gauss = _reduce_render_info_signal(render_info.get("tiles_per_gauss"), num_gaussians)
+        if tiles_per_gauss is not None:
+            visible_signal = (tiles_per_gauss.to(device=device, dtype=opacity_values.dtype) > 0).to(dtype=opacity_values.dtype)
+
+    if visible_signal is None:
+        return None, None
+
+    alpha_signal = visible_signal * opacity_values.detach()
+    return visible_signal.to(dtype=opacity_values.dtype), alpha_signal
+
+
+def update_gaussian_render_confidence(runtime_state, render_info, opacity_values, sparse_cfg):
+    if runtime_state is None:
+        return
+    opacity_values = opacity_values.detach().reshape(-1).clamp(0.0, 1.0)
+    if int(opacity_values.numel()) == 0:
+        return
+
+    if not bool(_cfg_get(sparse_cfg, "RENDER_CONFIDENCE_ENABLED", False)):
+        runtime_state["gaussian_visible_ema"] = opacity_values.clone()
+        runtime_state["gaussian_alpha_ema"] = opacity_values.clone()
+        runtime_state["gaussian_render_confidence"] = opacity_values.clone()
+        return
+
+    visible_weight = float(max(0.0, _cfg_get(sparse_cfg, "RENDER_CONFIDENCE_VISIBLE_WEIGHT", 0.5)))
+    alpha_weight = float(max(0.0, _cfg_get(sparse_cfg, "RENDER_CONFIDENCE_ALPHA_WEIGHT", 0.5)))
+    weight_sum = max(1.0e-6, visible_weight + alpha_weight)
+    visible_weight /= weight_sum
+    alpha_weight /= weight_sum
+    decay = float(min(max(_cfg_get(sparse_cfg, "RENDER_CONFIDENCE_EMA_DECAY", 0.95), 0.0), 0.999))
+
+    visible_signal, alpha_signal = extract_gaussian_render_signals(render_info, int(opacity_values.numel()), opacity_values)
+    if visible_signal is None:
+        visible_signal = opacity_values
+    if alpha_signal is None:
+        alpha_signal = opacity_values
+
+    runtime_state["gaussian_visible_ema"] = (
+        decay * runtime_state["gaussian_visible_ema"] + (1.0 - decay) * visible_signal
+    ).clamp(0.0, 1.0)
+    runtime_state["gaussian_alpha_ema"] = (
+        decay * runtime_state["gaussian_alpha_ema"] + (1.0 - decay) * alpha_signal
+    ).clamp(0.0, 1.0)
+    runtime_state["gaussian_render_confidence"] = (
+        visible_weight * runtime_state["gaussian_visible_ema"] + alpha_weight * runtime_state["gaussian_alpha_ema"]
+    ).clamp(0.0, 1.0)
+
+
 def chunked_nearest_neighbors(query_points, reference_points, chunk_size):
     query_count = int(query_points.shape[0])
     if query_count == 0:
@@ -989,6 +1113,7 @@ def run_sparse_topology_event(
     frozen_geometry_keys,
     total_steps,
     loss_modules,
+    runtime_state=None,
 ):
     event_info = {
         "record_type": "topology_event",
@@ -1018,6 +1143,9 @@ def run_sparse_topology_event(
         "spawn_surface_extra_count": 0,
         "prune_surface_score_mean": 0.0,
         "prune_surface_stable_ratio": 0.0,
+        "prune_render_confidence_mean": 0.0,
+        "prune_render_protected_ratio": 0.0,
+        "prune_render_filtered_count": 0,
     }
     if sparse_points is None or int(sparse_points.shape[0]) == 0:
         return optimizers, {}, event_info
@@ -1163,6 +1291,8 @@ def run_sparse_topology_event(
     prune_enabled = bool(_cfg_get(topology_cfg, "PRUNE_ENABLED", True)) and int(current_step) >= prune_start_step
     event_info["prune_active"] = int(prune_enabled)
     prune_mode = str(_cfg_get(topology_cfg, "PRUNE_MODE", "hard_remove")).lower()
+    prune_render_protection_enabled = bool(_cfg_get(topology_cfg, "PRUNE_RENDER_PROTECTION_ENABLED", False))
+    prune_render_confidence_max = float(min(max(_cfg_get(topology_cfg, "PRUNE_RENDER_CONFIDENCE_MAX", 0.25), 0.0), 1.0))
     prune_indices = torch.zeros((0,), device=device, dtype=torch.long)
     if prune_enabled:
         (
@@ -1201,6 +1331,27 @@ def run_sparse_topology_event(
                 max_prune = int(max(0, math.floor(float(model.num_gaussians) * float(_cfg_get(topology_cfg, "MAX_PRUNE_RATIO_PER_EVENT", 0.01)))))
                 max_prune = min(max_prune, int(prune_candidates.numel()))
                 if max_prune > 0:
+                    prune_candidate_render_conf = None
+                    if runtime_state is not None and "gaussian_render_confidence" in runtime_state:
+                        render_conf_values = runtime_state["gaussian_render_confidence"].reshape(-1).to(device=device, dtype=opacity_values.dtype)
+                        if int(render_conf_values.numel()) == int(model.num_gaussians):
+                            prune_candidate_render_conf = render_conf_values[prune_candidates]
+                    if prune_candidate_render_conf is None:
+                        prune_candidate_render_conf = opacity_values[prune_candidates]
+                    if prune_render_protection_enabled:
+                        render_keep_mask = prune_candidate_render_conf <= prune_render_confidence_max
+                        protected_count = int((~render_keep_mask).sum().item())
+                        event_info["prune_render_filtered_count"] = protected_count
+                        event_info["prune_render_protected_ratio"] = float(protected_count / max(1, int(prune_candidates.numel())))
+                        prune_candidates = prune_candidates[render_keep_mask]
+                        prune_candidate_dist = prune_candidate_dist[render_keep_mask]
+                        prune_candidate_render_conf = prune_candidate_render_conf[render_keep_mask]
+                        max_prune = min(max_prune, int(prune_candidates.numel()))
+                    if max_prune <= 0 or int(prune_candidates.numel()) == 0:
+                        prune_candidates = prune_candidates[:0]
+                    if int(prune_candidates.numel()) == 0:
+                        max_prune = 0
+                if max_prune > 0:
                     candidate_opacity = opacity_values[prune_candidates]
                     prune_score = prune_candidate_dist * (1.0 - candidate_opacity).clamp_min(0.0)
                     prune_surface_metrics = None
@@ -1223,6 +1374,7 @@ def run_sparse_topology_event(
                     keep_pos = torch.topk(prune_score, k=max_prune, largest=True).indices
                     prune_indices = prune_candidates[keep_pos]
                     event_info["prune_distance_mean"] = float(prune_candidate_dist[keep_pos].mean().item())
+                    event_info["prune_render_confidence_mean"] = float(prune_candidate_render_conf[keep_pos].mean().item())
                     if prune_surface_metrics is not None:
                         event_info["prune_surface_score_mean"] = float(prune_surface_metrics["surface_score"][keep_pos].mean().item())
                         event_info["prune_surface_stable_ratio"] = float(prune_surface_metrics["stable_mask"][keep_pos].float().mean().item())
@@ -1249,6 +1401,13 @@ def run_sparse_topology_event(
 
     if int(prune_indices.numel()) > 0 or spawn_count > 0:
         mutate_model_splats(model, keep_mask, spawn_state, frozen_geometry_keys)
+        mutate_gaussian_runtime_state(
+            runtime_state,
+            keep_mask=keep_mask if int(prune_indices.numel()) > 0 else None,
+            append_count=spawn_count,
+            current_step=current_step,
+            device=device,
+        )
         optimizers, schedulers = build_optimizers_and_schedulers(
             model=model,
             cfg=cfg,
@@ -1318,6 +1477,7 @@ def train(config_path, device="cuda"):
     warmstart_checkpoint = _cfg_get(cfg, "WARMSTART_CHECKPOINT", None)
     if warmstart_checkpoint:
         load_warmstart_checkpoint(model, warmstart_checkpoint, device)
+    gaussian_runtime_state = initialize_gaussian_runtime_state(model)
     print(f"Initialized {model.num_gaussians} Gaussians")
     freeze_geometry = bool(_cfg_get(cfg, "FREEZE_GEOMETRY", False))
     frozen_geometry_keys = {"means", "quats", "scales"} if freeze_geometry else set()
@@ -1453,6 +1613,18 @@ def train(config_path, device="cuda"):
                 "tail_keep_orientation": int(bool(_cfg_get(sparse_cfg, "TAIL_KEEP_ORIENTATION", True))),
                 "tail_keep_anisotropic_scale": int(bool(_cfg_get(sparse_cfg, "TAIL_KEEP_ANISOTROPIC_SCALE", True))),
                 "tail_keep_normal_scale": int(bool(_cfg_get(sparse_cfg, "TAIL_KEEP_NORMAL_SCALE", True))),
+                "local_geometry_enabled": int(bool(_cfg_get(sparse_cfg, "LOCAL_GEOMETRY_ENABLED", False))),
+                "local_geometry_newborn_steps": int(_cfg_get(sparse_cfg, "LOCAL_GEOMETRY_NEWBORN_STEPS", 0)),
+                "local_geometry_opacity_thresh": float(_cfg_get(sparse_cfg, "LOCAL_GEOMETRY_OPACITY_THRESH", 0.0)),
+                "local_geometry_render_conf_thresh": float(_cfg_get(sparse_cfg, "LOCAL_GEOMETRY_RENDER_CONF_THRESH", 0.0)),
+                "local_geometry_mismatch_quantile": float(_cfg_get(sparse_cfg, "LOCAL_GEOMETRY_MISMATCH_QUANTILE", 0.75)),
+                "local_geometry_low_render_conf_requires_mismatch": int(bool(_cfg_get(sparse_cfg, "LOCAL_GEOMETRY_LOW_RENDER_CONF_REQUIRES_MISMATCH", True))),
+                "local_geometry_newborn_quota": int(_cfg_get(sparse_cfg, "LOCAL_GEOMETRY_NEWBORN_QUOTA", 128)),
+                "local_geometry_low_opacity_quota": int(_cfg_get(sparse_cfg, "LOCAL_GEOMETRY_LOW_OPACITY_QUOTA", 128)),
+                "render_confidence_enabled": int(bool(_cfg_get(sparse_cfg, "RENDER_CONFIDENCE_ENABLED", False))),
+                "render_confidence_ema_decay": float(_cfg_get(sparse_cfg, "RENDER_CONFIDENCE_EMA_DECAY", 0.95)),
+                "render_confidence_visible_weight": float(_cfg_get(sparse_cfg, "RENDER_CONFIDENCE_VISIBLE_WEIGHT", 0.5)),
+                "render_confidence_alpha_weight": float(_cfg_get(sparse_cfg, "RENDER_CONFIDENCE_ALPHA_WEIGHT", 0.5)),
                 "tail_difficulty_score": str(_cfg_get(sparse_cfg, "TAIL_DIFFICULTY_SCORE", "stable_surface_mixed")),
                 "tail_difficulty_distance_weight": float(_cfg_get(sparse_cfg, "TAIL_DIFFICULTY_DISTANCE_WEIGHT", 0.75)),
                 "tail_difficulty_orientation_weight": float(_cfg_get(sparse_cfg, "TAIL_DIFFICULTY_ORIENTATION_WEIGHT", 0.75)),
@@ -1491,6 +1663,8 @@ def train(config_path, device="cuda"):
                 "topology_prune_reliable_core_rule": str(_cfg_get(topology_cfg, "PRUNE_RELIABLE_CORE_RULE", "support_quantile")) if topology_enabled else "disabled",
                 "topology_prune_core_support_quantile": float(_cfg_get(topology_cfg, "PRUNE_CORE_SUPPORT_QUANTILE", 0.7)) if topology_enabled else 0.0,
                 "topology_prune_core_min_points": int(_cfg_get(topology_cfg, "PRUNE_CORE_MIN_POINTS", 0)) if topology_enabled else 0,
+                "topology_prune_render_protection_enabled": int(bool(_cfg_get(topology_cfg, "PRUNE_RENDER_PROTECTION_ENABLED", False))) if topology_enabled else 0,
+                "topology_prune_render_confidence_max": float(_cfg_get(topology_cfg, "PRUNE_RENDER_CONFIDENCE_MAX", 0.0)) if topology_enabled else 0.0,
                 "adaptive_coverage_enabled": int(bool(_cfg_get(topology_cfg, "ADAPTIVE_COVERAGE_ENABLED", True))) if topology_enabled else 0,
                 "coverage_radius_density_scale": float(_cfg_get(topology_cfg, "COVERAGE_RADIUS_DENSITY_SCALE", 2.0)) if topology_enabled else 0.0,
                 "coverage_radius_min_scale": float(_cfg_get(topology_cfg, "COVERAGE_RADIUS_MIN_SCALE", 0.5)) if topology_enabled else 0.0,
@@ -1530,6 +1704,12 @@ def train(config_path, device="cuda"):
         multiview_active = is_multiview_active(loss_modules, current_step)
         render_outputs = model(camtoworld, H, W, render_heads=aux_heads, render_geom_depth=multiview_active)
         rendered = render_outputs["recon_rgb"]
+        update_gaussian_render_confidence(
+            gaussian_runtime_state,
+            render_outputs.get("info", {}),
+            torch.sigmoid(model.splats["opacities"].detach().reshape(-1)),
+            sparse_cfg,
+        )
 
         neighbor_record = train_dataset.get_pose_neighbor(data["infos"]["frame_key"]) if multiview_active else None
         neighbor_outputs = None
@@ -1554,6 +1734,8 @@ def train(config_path, device="cuda"):
             "gaussian_quats": model.splats["quats"],
             "gaussian_scales": model.splats["scales"],
             "gaussian_opacities": model.splats["opacities"],
+            "gaussian_birth_step": gaussian_runtime_state["gaussian_birth_step"],
+            "gaussian_render_confidence": gaussian_runtime_state["gaussian_render_confidence"],
             "depth_aux": render_outputs["depth_aux"],
             "geom_depth": render_outputs["geom_depth"],
             "alphas": render_outputs["alphas"],
@@ -1630,6 +1812,9 @@ def train(config_path, device="cuda"):
             "spawn_surface_extra_count": 0,
             "prune_surface_score_mean": 0.0,
             "prune_surface_stable_ratio": 0.0,
+            "prune_render_confidence_mean": 0.0,
+            "prune_render_protected_ratio": 0.0,
+            "prune_render_filtered_count": 0,
         }
 
         if strategy is not None:
@@ -1727,6 +1912,17 @@ def train(config_path, device="cuda"):
                 "tail_point_to_plane_effective_ratio": float(loss_logs.get("sparse_guided_tail_point_to_plane_effective_ratio", 0.0)),
                 "tail_confidence_mask_ratio": float(loss_logs.get("sparse_guided_tail_confidence_mask_ratio", 0.0)),
                 "tail_plane_confidence_mean": float(loss_logs.get("sparse_guided_tail_plane_confidence_mean", 0.0)),
+                "local_geometry_mask_ratio": float(loss_logs.get("sparse_guided_local_geometry_mask_ratio", 0.0)),
+                "local_geometry_newborn_ratio": float(loss_logs.get("sparse_guided_local_geometry_newborn_ratio", 0.0)),
+                "local_geometry_low_opacity_ratio": float(loss_logs.get("sparse_guided_local_geometry_low_opacity_ratio", 0.0)),
+                "local_geometry_low_render_conf_ratio": float(loss_logs.get("sparse_guided_local_geometry_low_render_conf_ratio", 0.0)),
+                "local_geometry_high_mismatch_ratio": float(loss_logs.get("sparse_guided_local_geometry_high_mismatch_ratio", 0.0)),
+                "local_geometry_supplement_count": float(loss_logs.get("sparse_guided_local_geometry_supplement_count", 0.0)),
+                "local_geometry_newborn_quota_count": float(loss_logs.get("sparse_guided_local_geometry_newborn_quota_count", 0.0)),
+                "local_geometry_low_opacity_quota_count": float(loss_logs.get("sparse_guided_local_geometry_low_opacity_quota_count", 0.0)),
+                "render_confidence_mean": float(loss_logs.get("sparse_guided_render_confidence_mean", 0.0)),
+                "render_confidence_p50": float(loss_logs.get("sparse_guided_render_confidence_p50", 0.0)),
+                "render_confidence_p90": float(loss_logs.get("sparse_guided_render_confidence_p90", 0.0)),
                 "lr_means_current": float(optimizers["means"].param_groups[0]["lr"]) if "means" in optimizers and optimizers["means"].param_groups else 0.0,
                 "lr_scales_current": float(optimizers["scales"].param_groups[0]["lr"]) if "scales" in optimizers and optimizers["scales"].param_groups else 0.0,
                 "lr_quats_current": float(optimizers["quats"].param_groups[0]["lr"]) if "quats" in optimizers and optimizers["quats"].param_groups else 0.0,
@@ -1761,6 +1957,7 @@ def train(config_path, device="cuda"):
                 frozen_geometry_keys=frozen_geometry_keys,
                 total_steps=total_steps,
                 loss_modules=loss_modules,
+                runtime_state=gaussian_runtime_state,
             )
             if topology_schedulers:
                 schedulers = topology_schedulers
@@ -1790,6 +1987,9 @@ def train(config_path, device="cuda"):
                 "spawn_surface_extra_count": int(topology_record.get("spawn_surface_extra_count", topology_event_info["spawn_surface_extra_count"])),
                 "prune_surface_score_mean": float(topology_record.get("prune_surface_score_mean", topology_event_info["prune_surface_score_mean"])),
                 "prune_surface_stable_ratio": float(topology_record.get("prune_surface_stable_ratio", topology_event_info["prune_surface_stable_ratio"])),
+                "prune_render_confidence_mean": float(topology_record.get("prune_render_confidence_mean", topology_event_info["prune_render_confidence_mean"])),
+                "prune_render_protected_ratio": float(topology_record.get("prune_render_protected_ratio", topology_event_info["prune_render_protected_ratio"])),
+                "prune_render_filtered_count": int(topology_record.get("prune_render_filtered_count", topology_event_info["prune_render_filtered_count"])),
             })
             topology_diag_records.append(topology_record)
             if sparse_diag_enabled:

@@ -503,6 +503,14 @@ class SparsePointRegularizationLoss(BaseLossModule):
         difficulty_orientation_weight=0.5,
         difficulty_scale_weight=1.0,
         difficulty_normal_weight=0.5,
+        local_geometry_enabled=False,
+        local_geometry_newborn_steps=0,
+        local_geometry_opacity_thresh=0.0,
+        local_geometry_render_conf_thresh=0.0,
+        local_geometry_mismatch_quantile=0.75,
+        local_geometry_low_render_conf_requires_mismatch=True,
+        local_geometry_newborn_quota=128,
+        local_geometry_low_opacity_quota=128,
     ):
         super().__init__(name="sparse_guided", weight=weight, enabled=weight > 0.0, start_step=start_step, end_step=end_step)
         self.sample_points = int(max(1, sample_points))
@@ -587,6 +595,14 @@ class SparsePointRegularizationLoss(BaseLossModule):
         self.difficulty_orientation_weight = float(max(0.0, difficulty_orientation_weight))
         self.difficulty_scale_weight = float(max(0.0, difficulty_scale_weight))
         self.difficulty_normal_weight = float(max(0.0, difficulty_normal_weight))
+        self.local_geometry_enabled = bool(local_geometry_enabled)
+        self.local_geometry_newborn_steps = int(max(0, local_geometry_newborn_steps))
+        self.local_geometry_opacity_thresh = float(min(max(local_geometry_opacity_thresh, 0.0), 1.0))
+        self.local_geometry_render_conf_thresh = float(min(max(local_geometry_render_conf_thresh, 0.0), 1.0))
+        self.local_geometry_mismatch_quantile = float(min(max(local_geometry_mismatch_quantile, 0.0), 1.0))
+        self.local_geometry_low_render_conf_requires_mismatch = bool(local_geometry_low_render_conf_requires_mismatch)
+        self.local_geometry_newborn_quota = int(max(0, local_geometry_newborn_quota))
+        self.local_geometry_low_opacity_quota = int(max(0, local_geometry_low_opacity_quota))
         self.hard_candidate_multiplier = 4
         self.distance_chunk_size = 1024
         self._cached_support_key = None
@@ -753,6 +769,101 @@ class SparsePointRegularizationLoss(BaseLossModule):
         blended = 0.5 + 0.5 * plane_confidence
         return (1.0 - self.tail_difficulty_confidence_weight) + self.tail_difficulty_confidence_weight * blended
 
+    def _resolve_sampled_render_confidence(self, context, sampled_indices, sampled_opacity):
+        render_confidence = context.get("gaussian_render_confidence")
+        if render_confidence is None:
+            return sampled_opacity.detach().clamp(0.0, 1.0)
+        render_confidence = render_confidence.reshape(-1)
+        if int(render_confidence.numel()) == 0:
+            return sampled_opacity.detach().clamp(0.0, 1.0)
+        sampled_render_confidence = render_confidence[sampled_indices]
+        return sampled_render_confidence.to(device=sampled_opacity.device, dtype=sampled_opacity.dtype).clamp(0.0, 1.0)
+
+    def _build_local_geometry_supplement_indices(self, context, means, opacity_values, sparse_points, active_mask):
+        empty_indices = torch.zeros((0,), device=opacity_values.device, dtype=torch.long)
+        logs = {
+            "supplement_count": 0.0,
+            "newborn_quota_count": 0.0,
+            "low_opacity_quota_count": 0.0,
+        }
+        if not self.local_geometry_enabled:
+            return empty_indices, logs
+
+        supplement_groups = []
+        birth_steps = context.get("gaussian_birth_step")
+        if self.local_geometry_newborn_quota > 0 and birth_steps is not None and self.local_geometry_newborn_steps > 0:
+            birth_steps = birth_steps.reshape(-1).to(device=opacity_values.device)
+            if int(birth_steps.numel()) == int(opacity_values.numel()):
+                current_step = int(context.get("step", 0))
+                newborn_mask = (birth_steps >= 0) & ((current_step - birth_steps) <= self.local_geometry_newborn_steps) & (~active_mask)
+                newborn_candidates = torch.nonzero(newborn_mask, as_tuple=False).squeeze(-1)
+                if int(newborn_candidates.numel()) > 0:
+                    if int(newborn_candidates.numel()) > self.local_geometry_newborn_quota and int(sparse_points.shape[0]) > 0:
+                        newborn_dist = self._compute_min_sparse_distance(means[newborn_candidates].detach(), sparse_points)
+                        keep_pos = torch.topk(newborn_dist, k=self.local_geometry_newborn_quota, largest=True).indices
+                        newborn_candidates = newborn_candidates[keep_pos]
+                    supplement_groups.append(newborn_candidates)
+                    logs["newborn_quota_count"] = float(int(newborn_candidates.numel()))
+
+        if self.local_geometry_low_opacity_quota > 0 and self.local_geometry_opacity_thresh > 0.0 and int(sparse_points.shape[0]) > 0:
+            low_opacity_mask = (opacity_values > 1.0e-4) & (opacity_values <= self.local_geometry_opacity_thresh) & (~active_mask)
+            low_opacity_candidates = torch.nonzero(low_opacity_mask, as_tuple=False).squeeze(-1)
+            if int(low_opacity_candidates.numel()) > 0:
+                low_opacity_dist = self._compute_min_sparse_distance(means[low_opacity_candidates].detach(), sparse_points)
+                mismatch_threshold = torch.quantile(low_opacity_dist, self.local_geometry_mismatch_quantile)
+                mismatch_keep = low_opacity_dist >= mismatch_threshold
+                low_opacity_candidates = low_opacity_candidates[mismatch_keep]
+                low_opacity_dist = low_opacity_dist[mismatch_keep]
+                if int(low_opacity_candidates.numel()) > self.local_geometry_low_opacity_quota:
+                    keep_pos = torch.topk(low_opacity_dist, k=self.local_geometry_low_opacity_quota, largest=True).indices
+                    low_opacity_candidates = low_opacity_candidates[keep_pos]
+                if int(low_opacity_candidates.numel()) > 0:
+                    supplement_groups.append(low_opacity_candidates)
+                    logs["low_opacity_quota_count"] = float(int(low_opacity_candidates.numel()))
+
+        if not supplement_groups:
+            return empty_indices, logs
+        supplement_indices = torch.unique(torch.cat(supplement_groups, dim=0), sorted=False)
+        logs["supplement_count"] = float(int(supplement_indices.numel()))
+        return supplement_indices, logs
+
+    def _build_local_geometry_masks(self, context, sampled_indices, sampled_opacity, sampled_render_confidence, mismatch_values=None):
+        zero_mask = torch.zeros_like(sampled_opacity, dtype=torch.bool)
+        if not self.local_geometry_enabled:
+            return torch.ones_like(sampled_opacity, dtype=torch.bool), zero_mask, zero_mask, zero_mask, zero_mask
+
+        newborn_mask = zero_mask
+        birth_steps = context.get("gaussian_birth_step")
+        if birth_steps is not None and self.local_geometry_newborn_steps > 0:
+            birth_steps = birth_steps.reshape(-1)
+            if int(birth_steps.numel()) > 0:
+                sampled_birth_steps = birth_steps[sampled_indices].to(device=sampled_opacity.device)
+                current_step = int(context.get("step", 0))
+                newborn_mask = (sampled_birth_steps >= 0) & ((current_step - sampled_birth_steps) <= self.local_geometry_newborn_steps)
+
+        low_opacity_mask = zero_mask
+        if self.local_geometry_opacity_thresh > 0.0:
+            low_opacity_mask = sampled_opacity <= self.local_geometry_opacity_thresh
+
+        low_render_conf_mask = zero_mask
+        if self.local_geometry_render_conf_thresh > 0.0:
+            low_render_conf_mask = sampled_render_confidence <= self.local_geometry_render_conf_thresh
+
+        high_mismatch_mask = zero_mask
+        if mismatch_values is not None and int(mismatch_values.numel()) > 0:
+            mismatch_values = mismatch_values.detach().reshape(-1).to(device=sampled_opacity.device, dtype=sampled_opacity.dtype)
+            mismatch_threshold = torch.quantile(mismatch_values, self.local_geometry_mismatch_quantile)
+            high_mismatch_mask = mismatch_values >= mismatch_threshold
+
+        low_opacity_trigger = low_opacity_mask & high_mismatch_mask
+        if self.local_geometry_low_render_conf_requires_mismatch:
+            low_render_conf_trigger = low_render_conf_mask & high_mismatch_mask
+        else:
+            low_render_conf_trigger = low_render_conf_mask
+
+        local_geometry_mask = newborn_mask | low_opacity_trigger | low_render_conf_trigger
+        return local_geometry_mask, newborn_mask, low_opacity_trigger, low_render_conf_trigger, high_mismatch_mask
+
     def _update_topk(self, top_scores, top_positions, new_scores, new_positions, k):
         if k <= 0 or new_scores.numel() == 0:
             return top_scores, top_positions
@@ -908,6 +1019,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
             return {
                 "residual": barycenter_residual,
                 "barycenter_residual": barycenter_residual,
+                "point_to_plane_residual": zero,
                 "plane_residual": barycenter_residual,
                 "normal_residual": zero,
                 "tangent_residual": zero,
@@ -927,6 +1039,9 @@ class SparsePointRegularizationLoss(BaseLossModule):
                 "plane_confidence": zero,
                 "orientation_alignment_raw": zero,
                 "anisotropic_scale_target_raw": zero,
+                "tail_point_to_plane_active": False,
+                "tail_confidence_mask": torch.zeros_like(barycenter_residual, dtype=torch.bool),
+                "tail_confidence_weight": zero,
                 "stable_mask": torch.zeros_like(barycenter_residual, dtype=torch.bool),
                 "fallback_mask": torch.ones_like(barycenter_residual, dtype=torch.bool),
             }
@@ -948,9 +1063,9 @@ class SparsePointRegularizationLoss(BaseLossModule):
         normal_residual = signed_normal.abs()
         tangent_vec = delta - signed_normal.unsqueeze(-1) * normal
         tangent_residual = torch.norm(tangent_vec, dim=1)
-        geometry_residual = normal_residual + self.tangent_weight * tangent_residual
-        plane_residual = geometry_residual
-        tail_point_to_plane_residual = torch.where(stable_mask, geometry_residual, zero)
+        point_to_plane_residual = normal_residual + self.tangent_weight * tangent_residual
+        plane_residual = point_to_plane_residual
+        tail_point_to_plane_residual = torch.where(stable_mask, point_to_plane_residual, zero)
         local_radius, target_tangent_scale, target_normal_scale, target_tangent_scale_cap = self._build_scale_targets(neighborhood, normal, eigvals, eigvecs)
         tail_confidence_mask = stable_mask
         if self.tail_point_to_plane_no_fallback:
@@ -1013,7 +1128,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
             normal_scale_loss = self.normal_scale_weight * normal_scale_penalty
             plane_residual = plane_residual + normal_scale_loss
 
-        monitor_residual = torch.where(stable_mask, geometry_residual, barycenter_residual)
+        monitor_residual = torch.where(stable_mask, point_to_plane_residual, barycenter_residual)
         tail_point_to_plane_active = False
         if tail_phase_active:
             tail_residual = zero
@@ -1033,6 +1148,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
             "residual": residual,
             "barycenter_residual": barycenter_residual,
             "monitor_residual": monitor_residual,
+            "point_to_plane_residual": point_to_plane_residual,
             "plane_residual": plane_residual,
             "normal_residual": normal_residual,
             "tangent_residual": tangent_residual,
@@ -1053,6 +1169,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
             "plane_confidence": plane_confidence,
             "tail_point_to_plane_active": tail_point_to_plane_active,
             "tail_confidence_mask": tail_confidence_mask,
+            "tail_confidence_weight": tail_confidence_weight,
             "stable_mask": stable_mask,
             "fallback_mask": ~stable_mask,
         }
@@ -1249,13 +1366,28 @@ class SparsePointRegularizationLoss(BaseLossModule):
         self._cached_tail_hard_count = int(hard_count)
         return payload
 
-    def _sample_active_indices(self, means, active_indices, sparse_points, support_score, context, quats=None, scales=None):
+    def _sample_active_indices(self, means, active_indices, sparse_points, support_score, context, quats=None, scales=None, target_sample_points=None):
         active_count = int(active_indices.numel())
+        sample_points = self.sample_points if target_sample_points is None else int(max(0, target_sample_points))
         effective_sampling_mode = self._effective_sampling_mode(context)
         effective_difficulty_mode = self._effective_difficulty_mode(context, effective_sampling_mode)
         effective_hard_ratio = self.tail_hard_ratio if effective_sampling_mode == "stable_surface_mixed" else self.hard_ratio
         effective_random_sample_fallback = self.tail_random_sample_fallback if effective_sampling_mode == "stable_surface_mixed" else self.random_sample_fallback
-        if active_count <= self.sample_points:
+        if sample_points <= 0:
+            return torch.zeros((0,), device=active_indices.device, dtype=active_indices.dtype), {
+                "hard_sample_count": 0.0,
+                "random_sample_count": 0.0,
+                "candidate_count": float(active_count),
+                "sampling_mode": effective_sampling_mode,
+                "difficulty_score_mode": effective_difficulty_mode,
+                "hard_ratio": float(effective_hard_ratio),
+                "tail_stable_candidate_ratio": 0.0,
+                "tail_high_conf_candidate_ratio": 0.0,
+                "tail_sample_high_conf_ratio": 0.0,
+                "tail_scan_candidate_ratio": 0.0,
+            }
+
+        if active_count <= sample_points:
             return active_indices, {
                 "hard_sample_count": 0.0,
                 "random_sample_count": float(active_count),
@@ -1270,11 +1402,11 @@ class SparsePointRegularizationLoss(BaseLossModule):
             }
 
         if effective_sampling_mode == "random":
-            perm = torch.randperm(active_count, device=active_indices.device)[:self.sample_points]
+            perm = torch.randperm(active_count, device=active_indices.device)[:sample_points]
             return active_indices[perm], {
                 "hard_sample_count": 0.0,
-                "random_sample_count": float(self.sample_points),
-                "candidate_count": float(self.sample_points),
+                "random_sample_count": float(sample_points),
+                "candidate_count": float(sample_points),
                 "sampling_mode": effective_sampling_mode,
                 "difficulty_score_mode": effective_difficulty_mode,
                 "hard_ratio": float(effective_hard_ratio),
@@ -1285,14 +1417,14 @@ class SparsePointRegularizationLoss(BaseLossModule):
             }
 
         if effective_sampling_mode == "stable_surface_mixed":
-            hard_count = int(round(self.sample_points * effective_hard_ratio))
-            hard_count = min(max(0, hard_count), self.sample_points, active_count)
+            hard_count = int(round(sample_points * effective_hard_ratio))
+            hard_count = min(max(0, hard_count), sample_points, active_count)
             if hard_count <= 0:
-                perm = torch.randperm(active_count, device=active_indices.device)[:self.sample_points]
+                perm = torch.randperm(active_count, device=active_indices.device)[:sample_points]
                 return active_indices[perm], {
                     "hard_sample_count": 0.0,
-                    "random_sample_count": float(self.sample_points),
-                    "candidate_count": float(self.sample_points),
+                    "random_sample_count": float(sample_points),
+                    "candidate_count": float(sample_points),
                     "sampling_mode": effective_sampling_mode,
                     "difficulty_score_mode": effective_difficulty_mode,
                     "hard_ratio": float(effective_hard_ratio),
@@ -1302,7 +1434,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
                     "tail_scan_candidate_ratio": 0.0,
                 }
 
-            stable_target = min(self.sample_points, max(hard_count, int(round(self.sample_points * self.tail_stable_sample_ratio_floor))))
+            stable_target = min(sample_points, max(hard_count, int(round(sample_points * self.tail_stable_sample_ratio_floor))))
             tail_payload = self._mine_tail_hard_payload(
                 means,
                 active_indices,
@@ -1318,7 +1450,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
             selected_stable_positions = tail_payload["stable_positions"][: min(remaining_stable, int(tail_payload["stable_positions"].numel()))]
             hard_positions = torch.cat([selected_high_positions, selected_stable_positions], dim=0)
             hard_indices = active_indices[hard_positions]
-            random_count = self.sample_points - int(hard_indices.numel())
+            random_count = sample_points - int(hard_indices.numel())
             if random_count > 0 and effective_random_sample_fallback:
                 remaining_mask = torch.ones((active_count,), dtype=torch.bool, device=active_indices.device)
                 remaining_mask[hard_positions] = False
@@ -1348,14 +1480,14 @@ class SparsePointRegularizationLoss(BaseLossModule):
         if effective_sampling_mode not in {"hardest_mixed", "hardest_global_mixed"}:
             raise RuntimeError(f"Unsupported sparse sampling mode: {effective_sampling_mode}")
 
-        hard_count = int(round(self.sample_points * effective_hard_ratio))
-        hard_count = min(max(0, hard_count), self.sample_points, active_count)
+        hard_count = int(round(sample_points * effective_hard_ratio))
+        hard_count = min(max(0, hard_count), sample_points, active_count)
         if hard_count <= 0:
-            perm = torch.randperm(active_count, device=active_indices.device)[:self.sample_points]
+            perm = torch.randperm(active_count, device=active_indices.device)[:sample_points]
             return active_indices[perm], {
                 "hard_sample_count": 0.0,
-                "random_sample_count": float(self.sample_points),
-                "candidate_count": float(self.sample_points),
+                "random_sample_count": float(sample_points),
+                "candidate_count": float(sample_points),
                 "sampling_mode": effective_sampling_mode,
                 "difficulty_score_mode": effective_difficulty_mode,
                 "hard_ratio": float(effective_hard_ratio),
@@ -1366,7 +1498,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
             }
 
         if effective_sampling_mode == "hardest_global_mixed":
-            requested_hard = self.sample_points if not effective_random_sample_fallback else hard_count
+            requested_hard = sample_points if not effective_random_sample_fallback else hard_count
             hard_positions = self._mine_global_hard_positions(
                 means,
                 active_indices,
@@ -1378,7 +1510,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
                 scales,
             )
             hard_indices = active_indices[hard_positions]
-            random_count = self.sample_points - int(hard_indices.numel())
+            random_count = sample_points - int(hard_indices.numel())
             if random_count > 0 and effective_random_sample_fallback:
                 remaining_mask = torch.ones((active_count,), dtype=torch.bool, device=active_indices.device)
                 remaining_mask[hard_positions] = False
@@ -1393,7 +1525,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
             candidate_count = float(active_count)
             hard_sample_count = float(int(hard_indices.numel()))
         else:
-            candidate_count = min(active_count, max(self.sample_points, hard_count * self.hard_candidate_multiplier))
+            candidate_count = min(active_count, max(sample_points, hard_count * self.hard_candidate_multiplier))
             candidate_perm = torch.randperm(active_count, device=active_indices.device)[:candidate_count]
             candidate_indices = active_indices[candidate_perm]
             with torch.no_grad():
@@ -1414,14 +1546,14 @@ class SparsePointRegularizationLoss(BaseLossModule):
             remaining_mask[candidate_perm[hard_pos]] = False
             remaining_indices = active_indices[remaining_mask]
 
-            random_count = self.sample_points - hard_count
+            random_count = sample_points - hard_count
             if random_count > 0 and effective_random_sample_fallback:
                 random_count = min(random_count, int(remaining_indices.numel()))
                 random_perm = torch.randperm(int(remaining_indices.numel()), device=active_indices.device)[:random_count]
                 random_indices = remaining_indices[random_perm]
                 sampled_indices = torch.cat([hard_indices, random_indices], dim=0)
             elif random_count > 0:
-                candidate_keep = min(candidate_count, self.sample_points)
+                candidate_keep = min(candidate_count, sample_points)
                 keep_pos = torch.topk(candidate_scores, k=candidate_keep, largest=True).indices
                 sampled_indices = candidate_indices[keep_pos]
                 random_count = 0
@@ -1472,6 +1604,17 @@ class SparsePointRegularizationLoss(BaseLossModule):
                 "tail_point_to_plane_effective_ratio": 0.0,
                 "tail_confidence_mask_ratio": 0.0,
                 "tail_plane_confidence_mean": 0.0,
+                "local_geometry_mask_ratio": 0.0,
+                "local_geometry_newborn_ratio": 0.0,
+                "local_geometry_low_opacity_ratio": 0.0,
+                "local_geometry_low_render_conf_ratio": 0.0,
+                "local_geometry_high_mismatch_ratio": 0.0,
+                "local_geometry_supplement_count": 0.0,
+                "local_geometry_newborn_quota_count": 0.0,
+                "local_geometry_low_opacity_quota_count": 0.0,
+                "render_confidence_mean": 0.0,
+                "render_confidence_p50": 0.0,
+                "render_confidence_p90": 0.0,
             }
 
         sparse_points = context.get("colmap_sparse_points")
@@ -1492,7 +1635,8 @@ class SparsePointRegularizationLoss(BaseLossModule):
 
         total_gaussians = int(means.shape[0])
         opacity_values = torch.sigmoid(opacities.reshape(-1))
-        active_indices = torch.nonzero(opacity_values > self.min_opacity, as_tuple=False).squeeze(-1)
+        active_mask = opacity_values > self.min_opacity
+        active_indices = torch.nonzero(active_mask, as_tuple=False).squeeze(-1)
         if active_indices.numel() == 0:
             zero = zero_scalar_like(context)
             return zero, {
@@ -1524,6 +1668,17 @@ class SparsePointRegularizationLoss(BaseLossModule):
                 "tail_point_to_plane_effective_ratio": 0.0,
                 "tail_confidence_mask_ratio": 0.0,
                 "tail_plane_confidence_mean": 0.0,
+                "local_geometry_mask_ratio": 0.0,
+                "local_geometry_newborn_ratio": 0.0,
+                "local_geometry_low_opacity_ratio": 0.0,
+                "local_geometry_low_render_conf_ratio": 0.0,
+                "local_geometry_high_mismatch_ratio": 0.0,
+                "local_geometry_supplement_count": 0.0,
+                "local_geometry_newborn_quota_count": 0.0,
+                "local_geometry_low_opacity_quota_count": 0.0,
+                "render_confidence_mean": 0.0,
+                "render_confidence_p50": 0.0,
+                "render_confidence_p90": 0.0,
             }
 
         quality_score, density_score, brightness_score, gradient_score, support_score = self._get_sparse_support_scores(
@@ -1533,7 +1688,28 @@ class SparsePointRegularizationLoss(BaseLossModule):
             sparse_brightness_score,
             sparse_gradient_score,
         )
-        sampled_indices, sampling_logs = self._sample_active_indices(means, active_indices, sparse_points, support_score, context, quats, scales)
+        supplement_indices, supplement_logs = self._build_local_geometry_supplement_indices(
+            context,
+            means,
+            opacity_values,
+            sparse_points,
+            active_mask,
+        )
+        main_sample_target = max(0, self.sample_points - int(supplement_indices.numel()))
+        sampled_active_indices, sampling_logs = self._sample_active_indices(
+            means,
+            active_indices,
+            sparse_points,
+            support_score,
+            context,
+            quats,
+            scales,
+            target_sample_points=main_sample_target,
+        )
+        if int(supplement_indices.numel()) > 0:
+            sampled_indices = torch.cat([sampled_active_indices, supplement_indices], dim=0)
+        else:
+            sampled_indices = sampled_active_indices
         sample_count = int(sampled_indices.numel())
         sampled_means = means[sampled_indices]
         sampled_quats = None if quats is None else quats[sampled_indices]
@@ -1542,8 +1718,51 @@ class SparsePointRegularizationLoss(BaseLossModule):
         neighborhood = self._build_support_neighborhood(sampled_means, sparse_points, support_score)
         tail_phase_active = self._is_tail_phase(context)
         residual_bundle = self._compute_residual_bundle(sampled_means, neighborhood, sampled_quats, sampled_scales, tail_phase_active=tail_phase_active)
-        target_dist = residual_bundle["residual"]
         monitor_dist = residual_bundle["monitor_residual"]
+        sampled_opacity = opacity_values[sampled_indices]
+        sampled_render_confidence = self._resolve_sampled_render_confidence(context, sampled_indices, sampled_opacity)
+        local_geometry_mask, newborn_mask, low_opacity_mask, low_render_conf_mask, high_mismatch_mask = self._build_local_geometry_masks(
+            context,
+            sampled_indices,
+            sampled_opacity,
+            sampled_render_confidence,
+            mismatch_values=monitor_dist,
+        )
+        stable_local_geometry_mask = residual_bundle["stable_mask"] & local_geometry_mask
+        point_to_plane_residual = residual_bundle["point_to_plane_residual"]
+        geometry_regularization = (
+            residual_bundle["orientation_loss"]
+            + residual_bundle["anisotropic_scale_target_loss"]
+            + residual_bundle["normal_scale_loss"]
+        )
+        if tail_phase_active:
+            tail_confidence_mask = residual_bundle["tail_confidence_mask"]
+            tail_confidence_weight = residual_bundle["tail_confidence_weight"]
+            target_dist = torch.zeros_like(point_to_plane_residual)
+            if self.tail_keep_point_to_plane and self.tail_point_to_plane_weight_scale > 0.0:
+                target_dist = target_dist + self.tail_point_to_plane_weight_scale * point_to_plane_residual * tail_confidence_weight
+            tail_local_geometry_mask = tail_confidence_mask & local_geometry_mask
+            tail_geometry_regularization = torch.zeros_like(point_to_plane_residual)
+            if self.tail_keep_orientation:
+                tail_geometry_regularization = tail_geometry_regularization + residual_bundle["orientation_loss"]
+            if self.tail_keep_anisotropic_scale:
+                tail_geometry_regularization = tail_geometry_regularization + residual_bundle["anisotropic_scale_target_loss"]
+            if self.tail_keep_normal_scale:
+                tail_geometry_regularization = tail_geometry_regularization + residual_bundle["normal_scale_loss"]
+            target_dist = target_dist + torch.where(
+                tail_local_geometry_mask,
+                tail_geometry_regularization * tail_confidence_weight,
+                torch.zeros_like(point_to_plane_residual),
+            )
+            effective_local_geometry_mask = tail_local_geometry_mask
+        else:
+            base_point_to_plane = torch.where(residual_bundle["stable_mask"], point_to_plane_residual, residual_bundle["barycenter_residual"])
+            target_dist = base_point_to_plane + torch.where(
+                stable_local_geometry_mask,
+                geometry_regularization,
+                torch.zeros_like(point_to_plane_residual),
+            )
+            effective_local_geometry_mask = stable_local_geometry_mask
         effective_difficulty_mode = sampling_logs.get("difficulty_score_mode", self._effective_difficulty_mode(context))
         sampled_min_sparse_distance = None
         if effective_difficulty_mode in {"min_sparse_dist", "vsurface_mixed", "stable_surface_mixed"}:
@@ -1563,7 +1782,6 @@ class SparsePointRegularizationLoss(BaseLossModule):
         else:
             robust_loss = target_dist
         loss = robust_loss.mean()
-        sampled_opacity = opacity_values[sampled_indices]
         logs = {
             "active": 1.0,
             "active_count": float(opacity_values.gt(self.min_opacity).sum().detach().item()),
@@ -1597,10 +1815,10 @@ class SparsePointRegularizationLoss(BaseLossModule):
             "normal_residual_mean": float(residual_bundle["normal_residual"].detach().mean().item()),
             "tangent_residual_mean": float(residual_bundle["tangent_residual"].detach().mean().item()),
             "point_to_plane_fallback_ratio": float(residual_bundle["fallback_mask"].float().mean().detach().item()),
-            "normal_scale_loss": _masked_mean(residual_bundle["normal_scale_loss"], residual_bundle["stable_mask"]),
-            "orientation_loss": _masked_mean(residual_bundle["orientation_loss"], residual_bundle["stable_mask"]),
+            "normal_scale_loss": _masked_mean(residual_bundle["normal_scale_loss"], effective_local_geometry_mask),
+            "orientation_loss": _masked_mean(residual_bundle["orientation_loss"], effective_local_geometry_mask),
             "orientation_alignment_mean": _masked_mean(residual_bundle["orientation_alignment"], residual_bundle["stable_mask"]),
-            "anisotropic_scale_target_loss": _masked_mean(residual_bundle["anisotropic_scale_target_loss"], residual_bundle["stable_mask"]),
+            "anisotropic_scale_target_loss": _masked_mean(residual_bundle["anisotropic_scale_target_loss"], effective_local_geometry_mask),
             "target_tangent_scale_mean": _masked_mean(residual_bundle["target_tangent_scale"], residual_bundle["stable_mask"]),
             "target_tangent_scale_cap_mean": _masked_mean(residual_bundle["target_tangent_scale_cap"], residual_bundle["stable_mask"]),
             "target_normal_scale_mean": _masked_mean(residual_bundle["target_normal_scale"], residual_bundle["stable_mask"]),
@@ -1612,6 +1830,15 @@ class SparsePointRegularizationLoss(BaseLossModule):
             "tail_point_to_plane_effective_ratio": float(residual_bundle["tail_confidence_mask"].float().mean().detach().item()) if tail_phase_active else 0.0,
             "tail_confidence_mask_ratio": float(residual_bundle["tail_confidence_mask"].float().mean().detach().item()) if tail_phase_active else 0.0,
             "tail_plane_confidence_mean": _masked_mean(residual_bundle["plane_confidence"], residual_bundle["tail_confidence_mask"]) if tail_phase_active else 0.0,
+            "local_geometry_mask_ratio": float(local_geometry_mask.float().mean().detach().item()),
+            "local_geometry_newborn_ratio": float(newborn_mask.float().mean().detach().item()),
+            "local_geometry_low_opacity_ratio": float(low_opacity_mask.float().mean().detach().item()),
+            "local_geometry_low_render_conf_ratio": float(low_render_conf_mask.float().mean().detach().item()),
+            "local_geometry_high_mismatch_ratio": float(high_mismatch_mask.float().mean().detach().item()),
+            "local_geometry_supplement_count": float(supplement_logs["supplement_count"]),
+            "local_geometry_newborn_quota_count": float(supplement_logs["newborn_quota_count"]),
+            "local_geometry_low_opacity_quota_count": float(supplement_logs["low_opacity_quota_count"]),
+            "render_confidence_mean": float(sampled_render_confidence.detach().mean().item()),
         }
         logs.update(_quantile_logs("distance", monitor_dist, [(0.50, "p50"), (0.90, "p90"), (0.99, "p99")]))
         logs.update(_quantile_logs("plane_residual", residual_bundle["plane_residual"], [(0.50, "p50"), (0.90, "p90")]))
@@ -1622,6 +1849,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
         logs.update(_quantile_logs("support_score", support_score, [(0.10, "p10"), (0.50, "p50"), (0.90, "p90")]))
         logs.update(_quantile_logs("difficulty", difficulty_scores, [(0.50, "p50"), (0.90, "p90")]))
         logs.update(_masked_quantile_logs("orientation_alignment", residual_bundle["orientation_alignment"], residual_bundle["stable_mask"], [(0.50, "p50"), (0.90, "p90")]))
+        logs.update(_quantile_logs("render_confidence", sampled_render_confidence, [(0.50, "p50"), (0.90, "p90")]))
         return loss, logs
 
 

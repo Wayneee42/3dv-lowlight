@@ -230,6 +230,14 @@ def build_loss_modules(meta_cfg, model_cfg):
                 difficulty_orientation_weight=float(_cfg_get(sparse_cfg, "DIFFICULTY_ORIENTATION_WEIGHT", 0.5)),
                 difficulty_scale_weight=float(_cfg_get(sparse_cfg, "DIFFICULTY_SCALE_WEIGHT", 1.0)),
                 difficulty_normal_weight=float(_cfg_get(sparse_cfg, "DIFFICULTY_NORMAL_WEIGHT", 0.5)),
+                local_geometry_enabled=bool(_cfg_get(sparse_cfg, "LOCAL_GEOMETRY_ENABLED", False)),
+                local_geometry_newborn_steps=int(_cfg_get(sparse_cfg, "LOCAL_GEOMETRY_NEWBORN_STEPS", 0)),
+                local_geometry_opacity_thresh=float(_cfg_get(sparse_cfg, "LOCAL_GEOMETRY_OPACITY_THRESH", 0.0)),
+                local_geometry_render_conf_thresh=float(_cfg_get(sparse_cfg, "LOCAL_GEOMETRY_RENDER_CONF_THRESH", 0.0)),
+                local_geometry_mismatch_quantile=float(_cfg_get(sparse_cfg, "LOCAL_GEOMETRY_MISMATCH_QUANTILE", 0.75)),
+                local_geometry_low_render_conf_requires_mismatch=bool(_cfg_get(sparse_cfg, "LOCAL_GEOMETRY_LOW_RENDER_CONF_REQUIRES_MISMATCH", True)),
+                local_geometry_newborn_quota=int(_cfg_get(sparse_cfg, "LOCAL_GEOMETRY_NEWBORN_QUOTA", 128)),
+                local_geometry_low_opacity_quota=int(_cfg_get(sparse_cfg, "LOCAL_GEOMETRY_LOW_OPACITY_QUOTA", 128)),
             )
         )
 
