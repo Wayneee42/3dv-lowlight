@@ -222,12 +222,18 @@ def summarize_stage6_records(records):
         "mean_psnr_base": mean_value("psnr_base"),
         "mean_psnr_recon": mean_value("psnr_recon"),
         "mean_low_mean": mean_value("low_mean"),
-        "mean_proxy_mean": mean_value("proxy_mean"),
         "mean_proxy_y_mean": mean_value("proxy_y_mean"),
-        "mean_proxy_target_mean": mean_value("proxy_target_mean"),
+        "mean_proxy_target_mean_raw": mean_value("proxy_target_mean_raw"),
+        "mean_proxy_effective_y_target_mean": mean_value("proxy_effective_y_target_mean"),
         "mean_proxy_gain": mean_value("proxy_gain"),
-        "mean_proxy_post_match_scale": mean_value("proxy_post_match_scale"),
-        "mean_proxy_shadow_weight_mean": mean_value("proxy_shadow_weight_mean"),
+        "mean_proxy_pre_y_mean": mean_value("proxy_pre_y_mean"),
+        "mean_proxy_pre_y_p95": mean_value("proxy_pre_y_p95"),
+        "mean_proxy_pre_sat_ratio": mean_value("proxy_pre_sat_ratio"),
+        "mean_proxy_gain_safety": mean_value("proxy_gain_safety"),
+        "mean_proxy_sat_safety": mean_value("proxy_sat_safety"),
+        "mean_proxy_push_safety": mean_value("proxy_push_safety"),
+        "mean_proxy_post_global_ratio": mean_value("proxy_post_global"),
+        "mean_proxy_post_delta": mean_value("proxy_post_delta"),
         "mean_rgb_base_y_mean": mean_value("rgb_base_y_mean"),
         "mean_recon_y_mean": mean_value("recon_y_mean"),
         "final_rgb_base_loss": float(last_record.get("rgb_base_loss", 0.0)),
@@ -237,12 +243,18 @@ def summarize_stage6_records(records):
         "final_psnr_base": float(last_record.get("psnr_base", 0.0)),
         "final_psnr_recon": float(last_record.get("psnr_recon", 0.0)),
         "final_low_mean": float(last_record.get("low_mean", 0.0)),
-        "final_proxy_mean": float(last_record.get("proxy_mean", 0.0)),
         "final_proxy_y_mean": float(last_record.get("proxy_y_mean", 0.0)),
-        "final_proxy_target_mean": float(last_record.get("proxy_target_mean", 0.0)),
+        "final_proxy_target_mean_raw": float(last_record.get("proxy_target_mean_raw", 0.0)),
+        "final_proxy_effective_y_target_mean": float(last_record.get("proxy_effective_y_target_mean", 0.0)),
         "final_proxy_gain": float(last_record.get("proxy_gain", 0.0)),
-        "final_proxy_post_match_scale": float(last_record.get("proxy_post_match_scale", 0.0)),
-        "final_proxy_shadow_weight_mean": float(last_record.get("proxy_shadow_weight_mean", 0.0)),
+        "final_proxy_pre_y_mean": float(last_record.get("proxy_pre_y_mean", 0.0)),
+        "final_proxy_pre_y_p95": float(last_record.get("proxy_pre_y_p95", 0.0)),
+        "final_proxy_pre_sat_ratio": float(last_record.get("proxy_pre_sat_ratio", 0.0)),
+        "final_proxy_gain_safety": float(last_record.get("proxy_gain_safety", 0.0)),
+        "final_proxy_sat_safety": float(last_record.get("proxy_sat_safety", 0.0)),
+        "final_proxy_push_safety": float(last_record.get("proxy_push_safety", 0.0)),
+        "final_proxy_post_global": float(last_record.get("proxy_post_global", 0.0)),
+        "final_proxy_post_delta": float(last_record.get("proxy_post_delta", 0.0)),
         "final_rgb_base_y_mean": float(last_record.get("rgb_base_y_mean", 0.0)),
         "final_recon_y_mean": float(last_record.get("recon_y_mean", 0.0)),
     }
@@ -1883,6 +1895,16 @@ def train(config_path, device="cuda"):
             "proxy_post_match_y_mean_enabled": int(bool(_cfg_get(proxy_cfg, "POST_MATCH_Y_MEAN_ENABLED", True))),
             "proxy_post_match_search_steps": int(_cfg_get(proxy_cfg, "POST_MATCH_SEARCH_STEPS", 12)),
             "proxy_post_match_max_gain": float(_cfg_get(proxy_cfg, "POST_MATCH_MAX_GAIN", _cfg_get(proxy_cfg, "MAX_GAIN", 1.0))),
+            "proxy_post_match_max_delta": float(_cfg_get(proxy_cfg, "POST_MATCH_MAX_DELTA", 0.0)),
+            "proxy_post_match_gain_soft_ratio": float(_cfg_get(proxy_cfg, "POST_MATCH_GAIN_SOFT_RATIO", 0.75)),
+            "proxy_post_match_gain_hard_ratio": float(_cfg_get(proxy_cfg, "POST_MATCH_GAIN_HARD_RATIO", 0.95)),
+            "proxy_post_match_scene_sat_thresh": float(_cfg_get(proxy_cfg, "POST_MATCH_SCENE_SAT_THRESH", 0.95)),
+            "proxy_post_match_scene_sat_soft_ratio": float(_cfg_get(proxy_cfg, "POST_MATCH_SCENE_SAT_SOFT_RATIO", 0.18)),
+            "proxy_post_match_scene_sat_hard_ratio": float(_cfg_get(proxy_cfg, "POST_MATCH_SCENE_SAT_HARD_RATIO", 0.30)),
+            "proxy_post_match_headroom_power": float(_cfg_get(proxy_cfg, "POST_MATCH_HEADROOM_POWER", 1.5)),
+            "proxy_post_match_pixel_sat_soft": float(_cfg_get(proxy_cfg, "POST_MATCH_PIXEL_SAT_SOFT", 0.90)),
+            "proxy_post_match_pixel_sat_hard": float(_cfg_get(proxy_cfg, "POST_MATCH_PIXEL_SAT_HARD", 0.98)),
+            "proxy_post_match_global_route_push_safety_thresh": float(_cfg_get(proxy_cfg, "POST_MATCH_GLOBAL_ROUTE_PUSH_SAFETY_THRESH", 0.90)),
         }
         append_json_txt_record(stage6_diag_path, stage6_header_payload)
     pbar = tqdm(range(total_steps))
@@ -1956,6 +1978,8 @@ def train(config_path, device="cuda"):
             "reference_hwc": reference_image.permute(1, 2, 0),
             "proxy_target_hwc": proxy_target_image.permute(1, 2, 0),
             "proxy_target_mean": float(train_batch["proxy_target_mean"]),
+            "proxy_target_mean_raw": float(train_batch["proxy_target_mean_raw"]),
+            "proxy_effective_y_target_mean": float(train_batch["proxy_effective_y_target_mean"]),
             "base_lit_rgb": render_outputs.get("base_lit_rgb"),
             "target_mean": train_batch["target_mean"],
             "data": data,
@@ -1984,11 +2008,17 @@ def train(config_path, device="cuda"):
         loss_logs["proxy_shadow_mean"] = float(train_batch["proxy_shadow_mean"])
         loss_logs["proxy_blend_mean"] = float(train_batch["proxy_blend_mean"])
         loss_logs["proxy_y_mean"] = float(train_batch["proxy_y_mean"])
-        loss_logs["proxy_global_y_mean"] = float(train_batch["proxy_global_y_mean"])
-        loss_logs["proxy_shadow_y_mean"] = float(train_batch["proxy_shadow_y_mean"])
-        loss_logs["proxy_blend_y_mean"] = float(train_batch["proxy_blend_y_mean"])
-        loss_logs["proxy_post_match_scale"] = float(train_batch["proxy_post_match_scale"])
-        loss_logs["proxy_shadow_weight_mean"] = float(train_batch["proxy_shadow_weight_mean"])
+        loss_logs["proxy_target_mean_raw"] = float(train_batch["proxy_target_mean_raw"])
+        loss_logs["proxy_effective_y_target_mean"] = float(train_batch["proxy_effective_y_target_mean"])
+        loss_logs["proxy_pre_y_mean"] = float(train_batch["proxy_pre_y_mean"])
+        loss_logs["proxy_pre_y_p95"] = float(train_batch["proxy_pre_y_p95"])
+        loss_logs["proxy_pre_sat_ratio"] = float(train_batch["proxy_pre_sat_ratio"])
+        loss_logs["proxy_gain_safety"] = float(train_batch["proxy_gain_safety"])
+        loss_logs["proxy_sat_safety"] = float(train_batch["proxy_sat_safety"])
+        loss_logs["proxy_push_safety"] = float(train_batch["proxy_push_safety"])
+        loss_logs["proxy_post_applied"] = float(train_batch["proxy_post_applied"])
+        loss_logs["proxy_post_delta"] = float(train_batch["proxy_post_delta"])
+        loss_logs["proxy_post_global"] = float(str(train_batch["proxy_post_route"]).lower() == "global")
         loss_logs["low_mean"] = float(train_batch["low_mean"])
         loss_logs["neighbor_distance"] = float(neighbor_distance)
         loss_logs["chroma_available"] = float(render_outputs.get("chroma_aux") is not None)
@@ -2046,44 +2076,27 @@ def train(config_path, device="cuda"):
                     "luminance_anchor_weight": float(loss_logs.get("luminance_reconstruction_anchor_weight", 0.0)),
                     "luminance_anchor_pred_mean": float(loss_logs.get("luminance_reconstruction_anchor_pred_mean", 0.0)),
                     "luminance_anchor_target_mean": float(loss_logs.get("luminance_reconstruction_anchor_target_mean", 0.0)),
-                    "luminance_anchor_weight_mean": float(loss_logs.get("luminance_reconstruction_anchor_weight_mean", 1.0)),
                     "chroma_reconstruction_loss": float(loss_logs.get("chroma_reconstruction", 0.0)),
-                    "chroma_regularization_loss": float(loss_logs.get("chroma_reg", 0.0)),
-                    "luminance_weight_mean": float(loss_logs.get("luminance_reconstruction_weight_mean", 1.0)),
-                    "chroma_weight_mean": float(loss_logs.get("chroma_reconstruction_weight_mean", 1.0)),
                     "psnr_base": float(psnr_base),
                     "psnr_recon": float(psnr_recon),
                     "low_mean": float(train_batch["low_mean"]),
                     "supervision_y_mean": float(rgb_hwc_luma_mean(base_target)),
                     "rgb_base_y_mean": float(rgb_hwc_luma_mean(base_render)),
                     "recon_y_mean": float(rgb_hwc_luma_mean(recon_render)),
-                    "proxy_mean": float(train_batch["proxy_mean"]),
                     "proxy_y_mean": float(train_batch["proxy_y_mean"]),
-                    "proxy_stat_mean": float(train_batch["proxy_stat_mean"]),
                     "proxy_gain": float(train_batch["proxy_scale"]),
-                    "proxy_form": str(train_batch["proxy_form"]),
-                    "proxy_global_mean": float(train_batch["proxy_global_mean"]),
-                    "proxy_shadow_mean": float(train_batch["proxy_shadow_mean"]),
-                    "proxy_global_y_mean": float(train_batch["proxy_global_y_mean"]),
-                    "proxy_shadow_y_mean": float(train_batch["proxy_shadow_y_mean"]),
-                    "proxy_blend_y_mean": float(train_batch["proxy_blend_y_mean"]),
-                    "proxy_post_match_scale": float(train_batch["proxy_post_match_scale"]),
-                    "proxy_shadow_weight_mean": float(train_batch["proxy_shadow_weight_mean"]),
-                    "proxy_target_mean": float(train_batch["proxy_target_mean"]),
-                    "proxy_base_target_mean": float(train_batch["proxy_base_target_mean"]),
-                    "proxy_calibration_scale": float(train_batch["proxy_calibration_scale"]),
-                    "proxy_stat_scale": float(train_batch["proxy_stat_scale"]),
-                    "proxy_highlight_scale": float(train_batch["proxy_highlight_scale"]),
-                    "proxy_highlight_value": float(train_batch["proxy_highlight_value"]),
-                    "proxy_calibration_mode": str(train_batch["proxy_calibration_mode"]),
-                    "target_mean": float(train_batch["target_mean"]),
-                    "illumination_available": int(render_outputs["illum_aux"] is not None),
-                    "chroma_available": int(render_outputs.get("chroma_aux") is not None),
-                    "lr_opacities_current": float(optimizers["opacities"].param_groups[0]["lr"]) if "opacities" in optimizers and optimizers["opacities"].param_groups else 0.0,
-                    "lr_sh0_current": float(optimizers["sh0"].param_groups[0]["lr"]) if "sh0" in optimizers and optimizers["sh0"].param_groups else 0.0,
-                    "lr_shn_current": float(optimizers["shN"].param_groups[0]["lr"]) if "shN" in optimizers and optimizers["shN"].param_groups else 0.0,
-                    "lr_illum_current": float(optimizers["illum_feat"].param_groups[0]["lr"]) if "illum_feat" in optimizers and optimizers["illum_feat"].param_groups else 0.0,
-                    "lr_chroma_current": float(optimizers["chroma_feat"].param_groups[0]["lr"]) if "chroma_feat" in optimizers and optimizers["chroma_feat"].param_groups else 0.0,
+                    "proxy_target_mean_raw": float(train_batch["proxy_target_mean_raw"]),
+                    "proxy_effective_y_target_mean": float(train_batch["proxy_effective_y_target_mean"]),
+                    "proxy_pre_y_mean": float(train_batch["proxy_pre_y_mean"]),
+                    "proxy_pre_y_p95": float(train_batch["proxy_pre_y_p95"]),
+                    "proxy_pre_sat_ratio": float(train_batch["proxy_pre_sat_ratio"]),
+                    "proxy_gain_safety": float(train_batch["proxy_gain_safety"]),
+                    "proxy_sat_safety": float(train_batch["proxy_sat_safety"]),
+                    "proxy_push_safety": float(train_batch["proxy_push_safety"]),
+                    "proxy_post_route": str(train_batch["proxy_post_route"]),
+                    "proxy_post_global": int(str(train_batch["proxy_post_route"]).lower() == "global"),
+                    "proxy_post_applied": int(train_batch["proxy_post_applied"]),
+                    "proxy_post_delta": float(train_batch["proxy_post_delta"]),
                 }
 
         if strategy is not None:

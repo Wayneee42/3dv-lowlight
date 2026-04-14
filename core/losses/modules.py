@@ -249,7 +249,7 @@ class LuminanceReconstructionLoss(BaseLossModule):
         pixel_loss = weighted_l1_loss(pred_y, target_y, weight_map)
         anchor_loss = torch.zeros((), device=pred_y.device, dtype=pred_y.dtype)
         pred_anchor_mean = self._weighted_mean(pred_y, None)
-        target_anchor_scalar = context.get("proxy_target_mean")
+        target_anchor_scalar = context.get("proxy_effective_y_target_mean", context.get("proxy_target_mean"))
         if target_anchor_scalar is None:
             target_anchor_mean = self._weighted_mean(target_y, None)
         else:
