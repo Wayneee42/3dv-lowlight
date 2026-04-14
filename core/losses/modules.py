@@ -453,6 +453,10 @@ class SparsePointRegularizationLoss(BaseLossModule):
         reliability_filter_enabled=False,
         lowlight_brightness_enabled=True,
         lowlight_gradient_enabled=True,
+        loss_support_use_brightness=True,
+        loss_support_use_gradient=True,
+        prune_support_use_brightness=True,
+        prune_support_use_gradient=True,
         weight_schedule="constant",
         weight_start_scale=1.0,
         weight_end_scale=1.0,
@@ -503,6 +507,16 @@ class SparsePointRegularizationLoss(BaseLossModule):
         difficulty_orientation_weight=0.5,
         difficulty_scale_weight=1.0,
         difficulty_normal_weight=0.5,
+        mid_hard_distance_q_low=0.40,
+        mid_hard_distance_q_high=0.90,
+        mid_hard_normal_weight=1.0,
+        mid_hard_tangent_weight=0.25,
+        mid_hard_orientation_weight=0.5,
+        mid_hard_scale_weight=0.5,
+        mid_hard_opacity_weight_power=0.5,
+        mid_hard_candidate_subset_ratio=1.0,
+        mid_hard_candidate_subset_min=None,
+        mid_hard_candidate_subset_max=None,
         local_geometry_enabled=False,
         local_geometry_newborn_steps=0,
         local_geometry_opacity_thresh=0.0,
@@ -539,6 +553,10 @@ class SparsePointRegularizationLoss(BaseLossModule):
         self.reliability_filter_enabled = bool(reliability_filter_enabled)
         self.lowlight_brightness_enabled = bool(lowlight_brightness_enabled)
         self.lowlight_gradient_enabled = bool(lowlight_gradient_enabled)
+        self.loss_support_use_brightness = bool(loss_support_use_brightness)
+        self.loss_support_use_gradient = bool(loss_support_use_gradient)
+        self.prune_support_use_brightness = bool(prune_support_use_brightness)
+        self.prune_support_use_gradient = bool(prune_support_use_gradient)
         self.weight_schedule = str(weight_schedule).lower()
         self.weight_start_scale = float(max(0.0, weight_start_scale))
         self.weight_end_scale = float(max(0.0, weight_end_scale))
@@ -595,6 +613,16 @@ class SparsePointRegularizationLoss(BaseLossModule):
         self.difficulty_orientation_weight = float(max(0.0, difficulty_orientation_weight))
         self.difficulty_scale_weight = float(max(0.0, difficulty_scale_weight))
         self.difficulty_normal_weight = float(max(0.0, difficulty_normal_weight))
+        self.mid_hard_distance_q_low = float(min(max(mid_hard_distance_q_low, 0.0), 1.0))
+        self.mid_hard_distance_q_high = float(min(max(mid_hard_distance_q_high, self.mid_hard_distance_q_low), 1.0))
+        self.mid_hard_normal_weight = float(max(0.0, mid_hard_normal_weight))
+        self.mid_hard_tangent_weight = float(max(0.0, mid_hard_tangent_weight))
+        self.mid_hard_orientation_weight = float(max(0.0, mid_hard_orientation_weight))
+        self.mid_hard_scale_weight = float(max(0.0, mid_hard_scale_weight))
+        self.mid_hard_opacity_weight_power = float(max(0.0, mid_hard_opacity_weight_power))
+        self.mid_hard_candidate_subset_ratio = float(min(max(mid_hard_candidate_subset_ratio, 0.0), 1.0))
+        self.mid_hard_candidate_subset_min = 0 if mid_hard_candidate_subset_min is None else int(max(0, mid_hard_candidate_subset_min))
+        self.mid_hard_candidate_subset_max = 0 if mid_hard_candidate_subset_max is None else int(max(0, mid_hard_candidate_subset_max))
         self.local_geometry_enabled = bool(local_geometry_enabled)
         self.local_geometry_newborn_steps = int(max(0, local_geometry_newborn_steps))
         self.local_geometry_opacity_thresh = float(min(max(local_geometry_opacity_thresh, 0.0), 1.0))
@@ -610,7 +638,8 @@ class SparsePointRegularizationLoss(BaseLossModule):
         self._cached_density_score = None
         self._cached_brightness_score = None
         self._cached_gradient_score = None
-        self._cached_support_score = None
+        self._cached_loss_support_score = None
+        self._cached_prune_support_score = None
         self._cached_hard_positions = None
         self._cached_hard_positions_step = -1
         self._cached_hard_active_count = -1
@@ -667,7 +696,8 @@ class SparsePointRegularizationLoss(BaseLossModule):
                 self._cached_density_score,
                 self._cached_brightness_score,
                 self._cached_gradient_score,
-                self._cached_support_score,
+                self._cached_loss_support_score,
+                self._cached_prune_support_score,
             )
 
         ones = torch.ones((sparse_points.shape[0],), device=sparse_points.device, dtype=sparse_points.dtype)
@@ -709,14 +739,26 @@ class SparsePointRegularizationLoss(BaseLossModule):
         else:
             gradient_score = ones
 
-        support_score = quality_score * density_score * brightness_score * gradient_score
+        base_support_score = quality_score * density_score
+        loss_support_score = base_support_score
+        if self.loss_support_use_brightness:
+            loss_support_score = loss_support_score * brightness_score
+        if self.loss_support_use_gradient:
+            loss_support_score = loss_support_score * gradient_score
+
+        prune_support_score = base_support_score
+        if self.prune_support_use_brightness:
+            prune_support_score = prune_support_score * brightness_score
+        if self.prune_support_use_gradient:
+            prune_support_score = prune_support_score * gradient_score
         self._cached_support_key = cache_key
         self._cached_quality_score = quality_score
         self._cached_density_score = density_score
         self._cached_brightness_score = brightness_score
         self._cached_gradient_score = gradient_score
-        self._cached_support_score = support_score
-        return quality_score, density_score, brightness_score, gradient_score, support_score
+        self._cached_loss_support_score = loss_support_score
+        self._cached_prune_support_score = prune_support_score
+        return quality_score, density_score, brightness_score, gradient_score, loss_support_score, prune_support_score
 
     def _sparse_weight_scale(self, context):
         if self.weight_schedule == "constant":
@@ -890,6 +932,23 @@ class SparsePointRegularizationLoss(BaseLossModule):
         return min(active_count, max(required_count, candidate_target))
 
     def _sample_tail_candidate_positions(self, active_count, candidate_count, device):
+        if candidate_count >= active_count:
+            return torch.arange(active_count, device=device, dtype=torch.long)
+        return torch.randperm(active_count, device=device)[:candidate_count]
+
+    def _mid_hard_candidate_target_count(self, active_count, hard_count):
+        if active_count <= 0:
+            return 0
+        required_count = min(active_count, max(1, int(hard_count)))
+        ratio_target = int(math.ceil(float(active_count) * self.mid_hard_candidate_subset_ratio))
+        candidate_target = max(required_count, hard_count * self.hard_candidate_multiplier, ratio_target)
+        if self.mid_hard_candidate_subset_min > 0:
+            candidate_target = max(candidate_target, self.mid_hard_candidate_subset_min)
+        if self.mid_hard_candidate_subset_max > 0:
+            candidate_target = min(candidate_target, self.mid_hard_candidate_subset_max)
+        return min(active_count, max(required_count, candidate_target))
+
+    def _sample_mid_hard_candidate_positions(self, active_count, candidate_count, device):
         if candidate_count >= active_count:
             return torch.arange(active_count, device=device, dtype=torch.long)
         return torch.randperm(active_count, device=device)[:candidate_count]
@@ -1179,11 +1238,52 @@ class SparsePointRegularizationLoss(BaseLossModule):
             return "min_sparse_dist"
         return self.difficulty_score
 
+    def _compute_mid_hard_surface_payload(self, min_sparse_distance, residual_bundle, opacity_values):
+        local_radius = residual_bundle["local_radius"].clamp_min(self.knn_eps)
+        normalized_distance = (min_sparse_distance / local_radius).clamp(0.0, 4.0)
+        normalized_normal = (residual_bundle["normal_residual"] / local_radius).clamp(0.0, 4.0)
+        normalized_tangent = (residual_bundle["tangent_residual"] / local_radius).clamp(0.0, 4.0)
+        if opacity_values is None:
+            opacity_weight = torch.ones_like(normalized_distance)
+        else:
+            opacity_weight = opacity_values.clamp(0.0, 1.0).pow(self.mid_hard_opacity_weight_power)
+        mid_hard_score = opacity_weight * (
+            self.mid_hard_normal_weight * normalized_normal
+            + self.mid_hard_tangent_weight * normalized_tangent
+            + self.mid_hard_orientation_weight * residual_bundle["orientation_alignment_raw"]
+            + self.mid_hard_scale_weight * residual_bundle["anisotropic_scale_target_raw"]
+        )
+        stable_mask = residual_bundle["stable_mask"]
+        if bool(stable_mask.any().item()):
+            stable_distance = normalized_distance[stable_mask]
+            band_quantiles = torch.quantile(
+                stable_distance,
+                stable_distance.new_tensor([self.mid_hard_distance_q_low, self.mid_hard_distance_q_high]),
+            )
+            distance_low = band_quantiles[0]
+            distance_high = band_quantiles[1]
+            mid_hard_mask = stable_mask & (normalized_distance >= distance_low) & (normalized_distance <= distance_high)
+        else:
+            distance_low = normalized_distance.new_zeros(())
+            distance_high = normalized_distance.new_zeros(())
+            mid_hard_mask = torch.zeros_like(stable_mask, dtype=torch.bool)
+        return {
+            "normalized_distance": normalized_distance,
+            "normalized_normal": normalized_normal,
+            "normalized_tangent": normalized_tangent,
+            "mid_hard_score": mid_hard_score,
+            "mid_hard_mask": mid_hard_mask,
+            "stable_mask": stable_mask,
+            "distance_low": distance_low,
+            "distance_high": distance_high,
+        }
+
     def _compute_difficulty_scores(
         self,
         query_points,
         sparse_points,
         support_score,
+        opacity_values=None,
         gaussian_quats=None,
         gaussian_scales=None,
         difficulty_mode=None,
@@ -1233,9 +1333,17 @@ class SparsePointRegularizationLoss(BaseLossModule):
             confidence_term = self._tail_confidence_term(residual_bundle["plane_confidence"])
             stable_gate = residual_bundle["stable_mask"].to(base_score.dtype)
             return base_score * confidence_term * stable_gate
+        if difficulty_mode == "mid_hard_surface":
+            if residual_bundle is None:
+                neighborhood = self._build_support_neighborhood(query_points, sparse_points, support_score)
+                residual_bundle = self._compute_residual_bundle(query_points, neighborhood, gaussian_quats, gaussian_scales, tail_phase_active=False)
+            if min_sparse_distance is None:
+                min_sparse_distance = self._compute_min_sparse_distance(query_points, sparse_points)
+            payload = self._compute_mid_hard_surface_payload(min_sparse_distance, residual_bundle, opacity_values)
+            return payload["mid_hard_score"]
         raise RuntimeError(f"Unsupported sparse difficulty score: {difficulty_mode}")
 
-    def _mine_global_hard_positions(self, means, active_indices, sparse_points, support_score, context, hard_count, quats=None, scales=None):
+    def _mine_global_hard_positions(self, means, active_indices, sparse_points, support_score, context, hard_count, opacity_values=None, quats=None, scales=None):
         step = int(context.get("step", 0))
         if (
             self._cached_hard_positions is not None
@@ -1249,21 +1357,55 @@ class SparsePointRegularizationLoss(BaseLossModule):
         top_scores = None
         top_positions = None
         active_count = int(active_indices.numel())
-        for start in range(0, active_count, self.global_mining_chunk_size):
-            end = min(start + self.global_mining_chunk_size, active_count)
-            chunk_positions = torch.arange(start, end, device=active_indices.device, dtype=torch.long)
-            chunk_indices = active_indices[start:end]
+        difficulty_mode = self._global_mining_difficulty_mode()
+        mid_hard_candidate_count = 0
+        mid_hard_distance_sum = 0.0
+        mid_hard_score_sum = 0.0
+        scan_positions = None
+        scan_count = active_count
+        if difficulty_mode == "mid_hard_surface":
+            scan_count = self._mid_hard_candidate_target_count(active_count, hard_count)
+            scan_positions = self._sample_mid_hard_candidate_positions(active_count, scan_count, active_indices.device)
+        else:
+            scan_positions = torch.arange(active_count, device=active_indices.device, dtype=torch.long)
+        for start in range(0, scan_count, self.global_mining_chunk_size):
+            end = min(start + self.global_mining_chunk_size, scan_count)
+            chunk_positions = scan_positions[start:end]
+            chunk_indices = active_indices[chunk_positions]
             with torch.no_grad():
+                chunk_means = means[chunk_indices].detach()
+                chunk_opacity = None if opacity_values is None else opacity_values[chunk_indices].detach()
                 chunk_quats = None if quats is None else quats[chunk_indices].detach()
                 chunk_scales = None if scales is None else scales[chunk_indices].detach()
-                chunk_scores = self._compute_difficulty_scores(
-                    means[chunk_indices].detach(),
-                    sparse_points,
-                    support_score,
-                    chunk_quats,
-                    chunk_scales,
-                    difficulty_mode=self._global_mining_difficulty_mode(),
-                )
+                if difficulty_mode == "mid_hard_surface":
+                    neighborhood = self._build_support_neighborhood(chunk_means, sparse_points, support_score)
+                    residual_bundle = self._compute_residual_bundle(chunk_means, neighborhood, chunk_quats, chunk_scales, tail_phase_active=False)
+                    chunk_min_sparse_distance = self._compute_min_sparse_distance(chunk_means, sparse_points)
+                    mid_hard_payload = self._compute_mid_hard_surface_payload(chunk_min_sparse_distance, residual_bundle, chunk_opacity)
+                    mid_hard_mask = mid_hard_payload["mid_hard_mask"]
+                    if bool(mid_hard_mask.any().item()):
+                        candidate_mask = mid_hard_mask
+                    elif bool(mid_hard_payload["stable_mask"].any().item()):
+                        candidate_mask = mid_hard_payload["stable_mask"]
+                    else:
+                        candidate_mask = torch.ones_like(mid_hard_mask, dtype=torch.bool)
+                    chunk_scores = mid_hard_payload["mid_hard_score"][candidate_mask]
+                    chunk_positions = chunk_positions[candidate_mask]
+                    mid_hard_count = int(mid_hard_mask.sum().item())
+                    mid_hard_candidate_count += mid_hard_count
+                    if mid_hard_count > 0:
+                        mid_hard_distance_sum += float(mid_hard_payload["normalized_distance"][mid_hard_mask].sum().item())
+                        mid_hard_score_sum += float(mid_hard_payload["mid_hard_score"][mid_hard_mask].sum().item())
+                else:
+                    chunk_scores = self._compute_difficulty_scores(
+                        chunk_means,
+                        sparse_points,
+                        support_score,
+                        opacity_values=chunk_opacity,
+                        gaussian_quats=chunk_quats,
+                        gaussian_scales=chunk_scales,
+                        difficulty_mode=difficulty_mode,
+                    )
 
             if top_scores is None:
                 keep = min(hard_count, int(chunk_scores.numel()))
@@ -1281,11 +1423,19 @@ class SparsePointRegularizationLoss(BaseLossModule):
 
         if top_positions is None:
             top_positions = torch.zeros((0,), device=active_indices.device, dtype=torch.long)
-        self._cached_hard_positions = top_positions
+        payload = {
+            "positions": top_positions,
+            "mid_hard_candidate_ratio": float(mid_hard_candidate_count / max(1, active_count)) if difficulty_mode == "mid_hard_surface" else 0.0,
+            "mid_hard_band_distance_mean": float(mid_hard_distance_sum / max(1, mid_hard_candidate_count)) if difficulty_mode == "mid_hard_surface" else 0.0,
+            "mid_hard_score_mean": float(mid_hard_score_sum / max(1, mid_hard_candidate_count)) if difficulty_mode == "mid_hard_surface" else 0.0,
+            "mid_hard_scan_candidate_count": float(scan_count if difficulty_mode == "mid_hard_surface" else active_count),
+            "mid_hard_scan_candidate_ratio": float(scan_count / max(1, active_count)) if difficulty_mode == "mid_hard_surface" else 1.0,
+        }
+        self._cached_hard_positions = payload
         self._cached_hard_positions_step = step
         self._cached_hard_active_count = active_count
         self._cached_hard_count = int(hard_count)
-        return top_positions
+        return payload
 
     def _mine_tail_hard_payload(self, means, active_indices, sparse_points, support_score, context, hard_count, quats=None, scales=None):
         step = int(context.get("step", 0))
@@ -1322,8 +1472,8 @@ class SparsePointRegularizationLoss(BaseLossModule):
                     chunk_means,
                     sparse_points,
                     support_score,
-                    chunk_quats,
-                    chunk_scales,
+                    gaussian_quats=chunk_quats,
+                    gaussian_scales=chunk_scales,
                     difficulty_mode=self.tail_difficulty_score,
                     residual_bundle=residual_bundle,
                     min_sparse_distance=chunk_min_sparse_distance,
@@ -1366,13 +1516,24 @@ class SparsePointRegularizationLoss(BaseLossModule):
         self._cached_tail_hard_count = int(hard_count)
         return payload
 
-    def _sample_active_indices(self, means, active_indices, sparse_points, support_score, context, quats=None, scales=None, target_sample_points=None):
+    def _sample_active_indices(self, means, active_indices, sparse_points, support_score, context, opacity_values=None, quats=None, scales=None, target_sample_points=None):
         active_count = int(active_indices.numel())
         sample_points = self.sample_points if target_sample_points is None else int(max(0, target_sample_points))
         effective_sampling_mode = self._effective_sampling_mode(context)
         effective_difficulty_mode = self._effective_difficulty_mode(context, effective_sampling_mode)
         effective_hard_ratio = self.tail_hard_ratio if effective_sampling_mode == "stable_surface_mixed" else self.hard_ratio
         effective_random_sample_fallback = self.tail_random_sample_fallback if effective_sampling_mode == "stable_surface_mixed" else self.random_sample_fallback
+        zero_sampling_logs = {
+            "tail_stable_candidate_ratio": 0.0,
+            "tail_high_conf_candidate_ratio": 0.0,
+            "tail_sample_high_conf_ratio": 0.0,
+            "tail_scan_candidate_ratio": 0.0,
+            "mid_hard_candidate_ratio": 0.0,
+            "mid_hard_band_distance_mean": 0.0,
+            "mid_hard_score_mean": 0.0,
+            "mid_hard_scan_candidate_count": 0.0,
+            "mid_hard_scan_candidate_ratio": 0.0,
+        }
         if sample_points <= 0:
             return torch.zeros((0,), device=active_indices.device, dtype=active_indices.dtype), {
                 "hard_sample_count": 0.0,
@@ -1381,10 +1542,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
                 "sampling_mode": effective_sampling_mode,
                 "difficulty_score_mode": effective_difficulty_mode,
                 "hard_ratio": float(effective_hard_ratio),
-                "tail_stable_candidate_ratio": 0.0,
-                "tail_high_conf_candidate_ratio": 0.0,
-                "tail_sample_high_conf_ratio": 0.0,
-                "tail_scan_candidate_ratio": 0.0,
+                **zero_sampling_logs,
             }
 
         if active_count <= sample_points:
@@ -1395,10 +1553,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
                 "sampling_mode": effective_sampling_mode,
                 "difficulty_score_mode": effective_difficulty_mode,
                 "hard_ratio": float(effective_hard_ratio),
-                "tail_stable_candidate_ratio": 0.0,
-                "tail_high_conf_candidate_ratio": 0.0,
-                "tail_sample_high_conf_ratio": 0.0,
-                "tail_scan_candidate_ratio": 0.0,
+                **zero_sampling_logs,
             }
 
         if effective_sampling_mode == "random":
@@ -1410,10 +1565,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
                 "sampling_mode": effective_sampling_mode,
                 "difficulty_score_mode": effective_difficulty_mode,
                 "hard_ratio": float(effective_hard_ratio),
-                "tail_stable_candidate_ratio": 0.0,
-                "tail_high_conf_candidate_ratio": 0.0,
-                "tail_sample_high_conf_ratio": 0.0,
-                "tail_scan_candidate_ratio": 0.0,
+                **zero_sampling_logs,
             }
 
         if effective_sampling_mode == "stable_surface_mixed":
@@ -1428,10 +1580,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
                     "sampling_mode": effective_sampling_mode,
                     "difficulty_score_mode": effective_difficulty_mode,
                     "hard_ratio": float(effective_hard_ratio),
-                    "tail_stable_candidate_ratio": 0.0,
-                    "tail_high_conf_candidate_ratio": 0.0,
-                    "tail_sample_high_conf_ratio": 0.0,
-                    "tail_scan_candidate_ratio": 0.0,
+                    **zero_sampling_logs,
                 }
 
             stable_target = min(sample_points, max(hard_count, int(round(sample_points * self.tail_stable_sample_ratio_floor))))
@@ -1475,6 +1624,11 @@ class SparsePointRegularizationLoss(BaseLossModule):
                 "tail_high_conf_candidate_ratio": float(tail_payload["high_conf_candidate_ratio"]),
                 "tail_sample_high_conf_ratio": float(int(selected_high_positions.numel()) / max(1, int(sampled_indices.numel()))),
                 "tail_scan_candidate_ratio": float(tail_payload.get("scan_candidate_ratio", 1.0)),
+                "mid_hard_candidate_ratio": 0.0,
+                "mid_hard_band_distance_mean": 0.0,
+                "mid_hard_score_mean": 0.0,
+                "mid_hard_scan_candidate_count": 0.0,
+                "mid_hard_scan_candidate_ratio": 0.0,
             }
 
         if effective_sampling_mode not in {"hardest_mixed", "hardest_global_mixed"}:
@@ -1491,24 +1645,24 @@ class SparsePointRegularizationLoss(BaseLossModule):
                 "sampling_mode": effective_sampling_mode,
                 "difficulty_score_mode": effective_difficulty_mode,
                 "hard_ratio": float(effective_hard_ratio),
-                "tail_stable_candidate_ratio": 0.0,
-                "tail_high_conf_candidate_ratio": 0.0,
-                "tail_sample_high_conf_ratio": 0.0,
-                "tail_scan_candidate_ratio": 0.0,
+                **zero_sampling_logs,
             }
 
+        hard_payload = None
         if effective_sampling_mode == "hardest_global_mixed":
             requested_hard = sample_points if not effective_random_sample_fallback else hard_count
-            hard_positions = self._mine_global_hard_positions(
+            hard_payload = self._mine_global_hard_positions(
                 means,
                 active_indices,
                 sparse_points,
                 support_score,
                 context,
                 requested_hard,
+                opacity_values,
                 quats,
                 scales,
             )
+            hard_positions = hard_payload["positions"]
             hard_indices = active_indices[hard_positions]
             random_count = sample_points - int(hard_indices.numel())
             if random_count > 0 and effective_random_sample_fallback:
@@ -1522,7 +1676,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
             else:
                 random_count = 0
                 sampled_indices = hard_indices
-            candidate_count = float(active_count)
+            candidate_count = float(hard_payload.get("mid_hard_scan_candidate_count", active_count))
             hard_sample_count = float(int(hard_indices.numel()))
         else:
             candidate_count = min(active_count, max(sample_points, hard_count * self.hard_candidate_multiplier))
@@ -1535,8 +1689,9 @@ class SparsePointRegularizationLoss(BaseLossModule):
                     means[candidate_indices].detach(),
                     sparse_points,
                     support_score,
-                    candidate_quats,
-                    candidate_scales,
+                    opacity_values=None if opacity_values is None else opacity_values[candidate_indices].detach(),
+                    gaussian_quats=candidate_quats,
+                    gaussian_scales=candidate_scales,
                     difficulty_mode=effective_difficulty_mode,
                 )
             hard_pos = torch.topk(candidate_scores, k=hard_count, largest=True).indices
@@ -1573,6 +1728,12 @@ class SparsePointRegularizationLoss(BaseLossModule):
             "tail_stable_candidate_ratio": 0.0,
             "tail_high_conf_candidate_ratio": 0.0,
             "tail_sample_high_conf_ratio": 0.0,
+            "tail_scan_candidate_ratio": 0.0,
+            "mid_hard_candidate_ratio": float(0.0 if hard_payload is None else hard_payload.get("mid_hard_candidate_ratio", 0.0)),
+            "mid_hard_band_distance_mean": float(0.0 if hard_payload is None else hard_payload.get("mid_hard_band_distance_mean", 0.0)),
+            "mid_hard_score_mean": float(0.0 if hard_payload is None else hard_payload.get("mid_hard_score_mean", 0.0)),
+            "mid_hard_scan_candidate_count": float(0.0 if hard_payload is None else hard_payload.get("mid_hard_scan_candidate_count", 0.0)),
+            "mid_hard_scan_candidate_ratio": float(0.0 if hard_payload is None else hard_payload.get("mid_hard_scan_candidate_ratio", 0.0)),
         }
 
     def compute(self, context):
@@ -1681,7 +1842,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
                 "render_confidence_p90": 0.0,
             }
 
-        quality_score, density_score, brightness_score, gradient_score, support_score = self._get_sparse_support_scores(
+        quality_score, density_score, brightness_score, gradient_score, loss_support_score, prune_support_score = self._get_sparse_support_scores(
             sparse_points,
             sparse_track_len,
             sparse_reproj_error,
@@ -1700,8 +1861,9 @@ class SparsePointRegularizationLoss(BaseLossModule):
             means,
             active_indices,
             sparse_points,
-            support_score,
+            loss_support_score,
             context,
+            opacity_values,
             quats,
             scales,
             target_sample_points=main_sample_target,
@@ -1715,7 +1877,7 @@ class SparsePointRegularizationLoss(BaseLossModule):
         sampled_quats = None if quats is None else quats[sampled_indices]
         sampled_scales = None if scales is None else scales[sampled_indices]
 
-        neighborhood = self._build_support_neighborhood(sampled_means, sparse_points, support_score)
+        neighborhood = self._build_support_neighborhood(sampled_means, sparse_points, loss_support_score)
         tail_phase_active = self._is_tail_phase(context)
         residual_bundle = self._compute_residual_bundle(sampled_means, neighborhood, sampled_quats, sampled_scales, tail_phase_active=tail_phase_active)
         monitor_dist = residual_bundle["monitor_residual"]
@@ -1765,18 +1927,40 @@ class SparsePointRegularizationLoss(BaseLossModule):
             effective_local_geometry_mask = stable_local_geometry_mask
         effective_difficulty_mode = sampling_logs.get("difficulty_score_mode", self._effective_difficulty_mode(context))
         sampled_min_sparse_distance = None
-        if effective_difficulty_mode in {"min_sparse_dist", "vsurface_mixed", "stable_surface_mixed"}:
+        if effective_difficulty_mode in {"min_sparse_dist", "vsurface_mixed", "stable_surface_mixed", "mid_hard_surface"}:
             sampled_min_sparse_distance = self._compute_min_sparse_distance(sampled_means.detach(), sparse_points)
         difficulty_scores = self._compute_difficulty_scores(
             sampled_means.detach(),
             sparse_points,
-            support_score,
-            None if sampled_quats is None else sampled_quats.detach(),
-            None if sampled_scales is None else sampled_scales.detach(),
+            loss_support_score,
+            opacity_values=sampled_opacity.detach(),
+            gaussian_quats=None if sampled_quats is None else sampled_quats.detach(),
+            gaussian_scales=None if sampled_scales is None else sampled_scales.detach(),
             difficulty_mode=effective_difficulty_mode,
             residual_bundle=residual_bundle,
             min_sparse_distance=sampled_min_sparse_distance,
         )
+        sampled_mid_hard_payload = None
+        sampled_mid_hard_score_logs = {"mid_hard_score_p50": 0.0, "mid_hard_score_p90": 0.0}
+        sampled_mid_hard_candidate_ratio = 0.0
+        sampled_mid_hard_band_distance_mean = 0.0
+        sampled_mid_hard_score_mean = 0.0
+        if effective_difficulty_mode == "mid_hard_surface" and sampled_min_sparse_distance is not None:
+            sampled_mid_hard_payload = self._compute_mid_hard_surface_payload(
+                sampled_min_sparse_distance,
+                residual_bundle,
+                sampled_opacity.detach(),
+            )
+            sampled_mid_hard_mask = sampled_mid_hard_payload["mid_hard_mask"]
+            sampled_mid_hard_candidate_ratio = float(sampled_mid_hard_mask.float().mean().item())
+            if bool(sampled_mid_hard_mask.any().item()):
+                sampled_mid_hard_band_distance_mean = float(sampled_mid_hard_payload["normalized_distance"][sampled_mid_hard_mask].mean().item())
+                sampled_mid_hard_score_mean = float(sampled_mid_hard_payload["mid_hard_score"][sampled_mid_hard_mask].mean().item())
+                sampled_mid_hard_score_logs = _quantile_logs(
+                    "mid_hard_score",
+                    sampled_mid_hard_payload["mid_hard_score"][sampled_mid_hard_mask],
+                    [(0.50, "p50"), (0.90, "p90")],
+                )
         if self.robust_scale > 0.0:
             robust_loss = torch.sqrt(target_dist.square() + self.robust_scale * self.robust_scale) - self.robust_scale
         else:
@@ -1799,7 +1983,9 @@ class SparsePointRegularizationLoss(BaseLossModule):
             "density_score_mean": float(density_score.detach().mean().item()),
             "brightness_score_mean": float(brightness_score.detach().mean().item()),
             "gradient_score_mean": float(gradient_score.detach().mean().item()),
-            "support_score_mean": float(support_score.detach().mean().item()),
+            "support_score_mean": float(loss_support_score.detach().mean().item()),
+            "loss_support_score_mean": float(loss_support_score.detach().mean().item()),
+            "prune_support_score_mean": float(prune_support_score.detach().mean().item()),
             "mode": self.mode,
             "sampling_mode": sampling_logs.get("sampling_mode", self.sampling_mode),
             "hard_ratio": float(sampling_logs.get("hard_ratio", self.hard_ratio)),
@@ -1811,6 +1997,13 @@ class SparsePointRegularizationLoss(BaseLossModule):
             "tail_high_conf_candidate_ratio": float(sampling_logs.get("tail_high_conf_candidate_ratio", 0.0)),
             "tail_sample_high_conf_ratio": float(sampling_logs.get("tail_sample_high_conf_ratio", 0.0)),
             "tail_scan_candidate_ratio": float(sampling_logs.get("tail_scan_candidate_ratio", 0.0)),
+            "mid_hard_candidate_ratio": float(sampling_logs.get("mid_hard_candidate_ratio", sampled_mid_hard_candidate_ratio)),
+            "mid_hard_distance_q_low": float(self.mid_hard_distance_q_low) if effective_difficulty_mode == "mid_hard_surface" else 0.0,
+            "mid_hard_distance_q_high": float(self.mid_hard_distance_q_high) if effective_difficulty_mode == "mid_hard_surface" else 0.0,
+            "mid_hard_band_distance_mean": float(sampling_logs.get("mid_hard_band_distance_mean", sampled_mid_hard_band_distance_mean)),
+            "mid_hard_score_mean": float(sampling_logs.get("mid_hard_score_mean", sampled_mid_hard_score_mean)),
+            "mid_hard_scan_candidate_count": float(sampling_logs.get("mid_hard_scan_candidate_count", 0.0)),
+            "mid_hard_scan_candidate_ratio": float(sampling_logs.get("mid_hard_scan_candidate_ratio", 0.0)),
             "difficulty_mean": float(difficulty_scores.detach().mean().item()),
             "normal_residual_mean": float(residual_bundle["normal_residual"].detach().mean().item()),
             "tangent_residual_mean": float(residual_bundle["tangent_residual"].detach().mean().item()),
@@ -1846,8 +2039,11 @@ class SparsePointRegularizationLoss(BaseLossModule):
         logs.update(_quantile_logs("density_score", density_score, [(0.10, "p10"), (0.50, "p50"), (0.90, "p90")]))
         logs.update(_quantile_logs("brightness_score", brightness_score, [(0.10, "p10"), (0.50, "p50"), (0.90, "p90")]))
         logs.update(_quantile_logs("gradient_score", gradient_score, [(0.10, "p10"), (0.50, "p50"), (0.90, "p90")]))
-        logs.update(_quantile_logs("support_score", support_score, [(0.10, "p10"), (0.50, "p50"), (0.90, "p90")]))
+        logs.update(_quantile_logs("support_score", loss_support_score, [(0.10, "p10"), (0.50, "p50"), (0.90, "p90")]))
+        logs.update(_quantile_logs("loss_support_score", loss_support_score, [(0.10, "p10"), (0.50, "p50"), (0.90, "p90")]))
+        logs.update(_quantile_logs("prune_support_score", prune_support_score, [(0.10, "p10"), (0.50, "p50"), (0.90, "p90")]))
         logs.update(_quantile_logs("difficulty", difficulty_scores, [(0.50, "p50"), (0.90, "p90")]))
+        logs.update(sampled_mid_hard_score_logs)
         logs.update(_masked_quantile_logs("orientation_alignment", residual_bundle["orientation_alignment"], residual_bundle["stable_mask"], [(0.50, "p50"), (0.90, "p90")]))
         logs.update(_quantile_logs("render_confidence", sampled_render_confidence, [(0.50, "p50"), (0.90, "p90")]))
         return loss, logs

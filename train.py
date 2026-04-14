@@ -73,7 +73,70 @@ def build_output_dir(config_path, meta_cfg):
 
 def should_write_sparse_diagnostics(config_path, sparse_cfg):
     config_stage_dir = Path(config_path).resolve().parent.name.lower()
-    return config_stage_dir in {"stage5b_ft_on", "stage5b_ft_v1", "stage5b_ft_v2", "stage5c_sparse_topology", "stage5c_vsurface"} and bool(_cfg_get(sparse_cfg, "ENABLED", False))
+    return config_stage_dir in {"stage5b_ft_on", "stage5b_ft_v1", "stage5b_ft_v2", "stage5c_sparse_topology", "stage5c_vsurface", "stage5c_vsurface_lite"} and bool(_cfg_get(sparse_cfg, "ENABLED", False))
+
+
+def should_write_stage6_diagnostics(config_path, has_reconstruction):
+    config_stage_dir = Path(config_path).resolve().parent.name.lower()
+    return config_stage_dir == "stage6_adaptive_chroma_ycbcr_additive" and bool(has_reconstruction)
+
+
+def is_vsurface_lite_stage(config_path):
+    return Path(config_path).resolve().parent.name.lower() == "stage5c_vsurface_lite"
+
+
+def requires_gaussian_runtime_state(sparse_cfg, topology_cfg):
+    return bool(
+        _cfg_get(sparse_cfg, "LOCAL_GEOMETRY_ENABLED", False)
+        or _cfg_get(sparse_cfg, "RENDER_CONFIDENCE_ENABLED", False)
+        or _cfg_get(topology_cfg, "PRUNE_RENDER_PROTECTION_ENABLED", False)
+    )
+
+
+LITE_DIAG_DROP_PREFIXES = (
+    "tail_",
+    "local_geometry_",
+    "render_confidence_",
+    "spawn_surface_",
+    "prune_render_",
+    "prune_surface_",
+)
+
+
+LITE_DIAG_DROP_KEYS = {
+    "surface_coupling_active",
+    "surface_coupling_enabled",
+    "max_surface_spawn_per_event",
+    "spawn_surface_score_weight",
+    "spawn_surface_additive_weight",
+    "spawn_surface_confidence_weight",
+    "spawn_surface_slack_weight",
+    "spawn_surface_score_clamp",
+    "spawn_surface_min_coverage_ratio",
+    "spawn_surface_min_confidence",
+    "prune_surface_score_weight",
+    "surface_score_normal_weight",
+    "surface_score_scale_weight",
+    "topology_prune_render_protection_enabled",
+    "topology_prune_render_confidence_max",
+    "lr_means_tail_target",
+    "lr_scales_tail_target",
+    "lr_quats_tail_target",
+    "lr_tail_start_step",
+}
+
+
+def filter_sparse_diag_payload(payload, lite_mode):
+    if not lite_mode or not isinstance(payload, dict):
+        return payload
+    filtered = {}
+    for key, value in payload.items():
+        if key in LITE_DIAG_DROP_KEYS:
+            continue
+        if any(str(key).startswith(prefix) for prefix in LITE_DIAG_DROP_PREFIXES):
+            continue
+        filtered[key] = value
+    return filtered
 
 
 def append_json_txt_record(path, payload):
@@ -139,10 +202,60 @@ def summarize_topology_records(records, final_num_gaussians):
     }
 
 
+def summarize_stage6_records(records):
+    if not records:
+        return None
+
+    def mean_value(key):
+        return float(sum(float(record.get(key, 0.0)) for record in records) / len(records))
+
+    last_record = records[-1]
+    return {
+        "record_type": "summary",
+        "num_snapshots": int(len(records)),
+        "first_step": int(records[0]["step"]),
+        "last_step": int(records[-1]["step"]),
+        "mean_rgb_base_loss": mean_value("rgb_base_loss"),
+        "mean_luminance_reconstruction_loss": mean_value("luminance_reconstruction_loss"),
+        "mean_chroma_reconstruction_loss": mean_value("chroma_reconstruction_loss"),
+        "mean_psnr_base": mean_value("psnr_base"),
+        "mean_psnr_recon": mean_value("psnr_recon"),
+        "mean_low_mean": mean_value("low_mean"),
+        "mean_proxy_mean": mean_value("proxy_mean"),
+        "mean_proxy_target_mean": mean_value("proxy_target_mean"),
+        "mean_proxy_gain": mean_value("proxy_gain"),
+        "mean_proxy_shadow_weight_mean": mean_value("proxy_shadow_weight_mean"),
+        "mean_rgb_base_y_mean": mean_value("rgb_base_y_mean"),
+        "mean_recon_y_mean": mean_value("recon_y_mean"),
+        "final_rgb_base_loss": float(last_record.get("rgb_base_loss", 0.0)),
+        "final_luminance_reconstruction_loss": float(last_record.get("luminance_reconstruction_loss", 0.0)),
+        "final_chroma_reconstruction_loss": float(last_record.get("chroma_reconstruction_loss", 0.0)),
+        "final_psnr_base": float(last_record.get("psnr_base", 0.0)),
+        "final_psnr_recon": float(last_record.get("psnr_recon", 0.0)),
+        "final_low_mean": float(last_record.get("low_mean", 0.0)),
+        "final_proxy_mean": float(last_record.get("proxy_mean", 0.0)),
+        "final_proxy_target_mean": float(last_record.get("proxy_target_mean", 0.0)),
+        "final_proxy_gain": float(last_record.get("proxy_gain", 0.0)),
+        "final_proxy_shadow_weight_mean": float(last_record.get("proxy_shadow_weight_mean", 0.0)),
+        "final_rgb_base_y_mean": float(last_record.get("rgb_base_y_mean", 0.0)),
+        "final_recon_y_mean": float(last_record.get("recon_y_mean", 0.0)),
+    }
+
+
 def rgb_chw_to_gray(image_tensor):
     if image_tensor is None:
         return None
     return 0.299 * image_tensor[0] + 0.587 * image_tensor[1] + 0.114 * image_tensor[2]
+
+
+def rgb_hwc_luma_mean(image_tensor):
+    if image_tensor is None:
+        return 0.0
+    image_tensor = image_tensor.detach()
+    if image_tensor.dim() != 3 or image_tensor.shape[-1] < 3:
+        return float(image_tensor.mean().item())
+    luma = 0.299 * image_tensor[..., 0] + 0.587 * image_tensor[..., 1] + 0.114 * image_tensor[..., 2]
+    return float(luma.mean().item())
 
 
 def is_multiview_active(loss_modules, step):
@@ -990,14 +1103,14 @@ def compute_vsurface_topology_metrics(
         return None
 
     with torch.no_grad():
-        _, _, _, _, support_score = sparse_module._get_sparse_support_scores(
+        _, _, _, _, loss_support_score, _ = sparse_module._get_sparse_support_scores(
             sparse_points,
             sparse_track_len,
             sparse_reproj_error,
             sparse_brightness_score,
             sparse_gradient_score,
         )
-        neighborhood = sparse_module._build_support_neighborhood(query_points, sparse_points, support_score)
+        neighborhood = sparse_module._build_support_neighborhood(query_points, sparse_points, loss_support_score)
         if int(neighborhood["neighbor_k"]) < 3:
             return None
 
@@ -1058,7 +1171,7 @@ def build_prune_reliable_core(
         return sparse_points, sparse_track_len, sparse_reproj_error, sparse_brightness_score, sparse_gradient_score, info
 
     with torch.no_grad():
-        _, _, _, _, support_score = sparse_module._get_sparse_support_scores(
+        _, _, _, _, _, prune_support_score = sparse_module._get_sparse_support_scores(
             sparse_points,
             sparse_track_len,
             sparse_reproj_error,
@@ -1076,14 +1189,14 @@ def build_prune_reliable_core(
         if int(num_sparse) <= min_core_points:
             core_mask = torch.ones((num_sparse,), device=sparse_points.device, dtype=torch.bool)
         else:
-            support_threshold = torch.quantile(support_score, support_quantile)
-            core_mask = support_score >= support_threshold
+            support_threshold = torch.quantile(prune_support_score, support_quantile)
+            core_mask = prune_support_score >= support_threshold
             if int(core_mask.sum().item()) < min_core_points:
-                topk = torch.topk(support_score, k=min_core_points, largest=True).indices
+                topk = torch.topk(prune_support_score, k=min_core_points, largest=True).indices
                 core_mask = torch.zeros((num_sparse,), device=sparse_points.device, dtype=torch.bool)
                 core_mask[topk] = True
         core_count = int(core_mask.sum().item())
-        core_support = support_score[core_mask]
+        core_support = prune_support_score[core_mask]
         info["core_count"] = core_count
         info["core_ratio"] = float(core_count / max(1, num_sparse))
         info["core_support_mean"] = float(core_support.mean().item()) if int(core_support.numel()) > 0 else 0.0
@@ -1141,6 +1254,8 @@ def run_sparse_topology_event(
         "spawn_surface_stable_ratio": 0.0,
         "spawn_surface_confidence_mean": 0.0,
         "spawn_surface_extra_count": 0,
+        "spawn_density_deficit_mean": 0.0,
+        "spawn_local_active_count_mean": 0.0,
         "prune_surface_score_mean": 0.0,
         "prune_surface_stable_ratio": 0.0,
         "prune_render_confidence_mean": 0.0,
@@ -1213,11 +1328,28 @@ def run_sparse_topology_event(
 
     spawn_enabled = bool(_cfg_get(topology_cfg, "SPAWN_ENABLED", True))
     max_spawn = int(max(0, _cfg_get(topology_cfg, "MAX_SPAWN_PER_EVENT", 2048))) if spawn_enabled else 0
+    spawn_density_deficit_weight = float(max(0.0, _cfg_get(topology_cfg, "SPAWN_DENSITY_DEFICIT_WEIGHT", 1.0)))
+    spawn_active_density_k = int(max(1, _cfg_get(topology_cfg, "SPAWN_ACTIVE_DENSITY_K", _cfg_get(topology_cfg, "SPAWN_SUPPORT_K", 8))))
+    spawn_active_density_radius_scale = float(max(1.0, _cfg_get(topology_cfg, "SPAWN_ACTIVE_DENSITY_RADIUS_SCALE", 2.5)))
     spawn_sparse_indices = coverage_hole_indices
     spawn_surface_metrics = None
     normalized_surface_all = None
     normalized_confidence_all = None
     nearest_existing_all = None
+    hole_density_deficit = None
+    hole_local_active_count = None
+    if coverage_hole_count > 0 and max_spawn > 0:
+        hole_points = sparse_points[coverage_hole_indices]
+        hole_knn_dist, _ = chunked_topk_neighbors(
+            hole_points,
+            active_means,
+            distance_chunk,
+            spawn_active_density_k,
+        )
+        if int(hole_knn_dist.shape[1]) > 0:
+            density_radius = adaptive_threshold[coverage_hole_indices] * spawn_active_density_radius_scale
+            hole_local_active_count = (hole_knn_dist <= density_radius.unsqueeze(1)).sum(dim=1).to(dtype=sparse_to_active_dist.dtype)
+            hole_density_deficit = 1.0 / (1.0 + hole_local_active_count)
     if event_info["surface_coupling_active"]:
         nearest_existing_all = active_indices[nearest_active_local.clamp_min(0)]
         spawn_surface_metrics = compute_vsurface_topology_metrics(
@@ -1240,13 +1372,22 @@ def run_sparse_topology_event(
             normalized_confidence_all = normalized_confidence_all.clamp(0.0, 2.5)
     if coverage_hole_count > 0 and max_spawn > 0:
         spawn_priority = coverage_excess[coverage_hole_indices] / coverage_excess[coverage_hole_indices].mean().clamp_min(1.0e-6)
+        selected_hole_pos = None
+        if hole_density_deficit is not None and spawn_density_deficit_weight > 0.0:
+            normalized_density_deficit = hole_density_deficit / hole_density_deficit.mean().clamp_min(1.0e-6)
+            spawn_priority = spawn_priority + spawn_density_deficit_weight * normalized_density_deficit
         if normalized_surface_all is not None and normalized_confidence_all is not None:
             hole_surface = normalized_surface_all[coverage_hole_indices]
             hole_confidence = normalized_confidence_all[coverage_hole_indices]
             spawn_priority = spawn_priority + spawn_surface_additive_weight * hole_surface + spawn_surface_confidence_weight * hole_confidence
             spawn_priority = spawn_priority * (1.0 + spawn_surface_score_weight * hole_surface)
         hole_order = torch.argsort(spawn_priority, descending=True)
-        spawn_sparse_indices = coverage_hole_indices[hole_order[: min(max_spawn, coverage_hole_count)]]
+        selected_hole_pos = hole_order[: min(max_spawn, coverage_hole_count)]
+        spawn_sparse_indices = coverage_hole_indices[selected_hole_pos]
+        if hole_density_deficit is not None and int(selected_hole_pos.numel()) > 0:
+            event_info["spawn_density_deficit_mean"] = float(hole_density_deficit[selected_hole_pos].mean().item())
+        if hole_local_active_count is not None and int(selected_hole_pos.numel()) > 0:
+            event_info["spawn_local_active_count_mean"] = float(hole_local_active_count[selected_hole_pos].mean().item())
     else:
         spawn_sparse_indices = coverage_hole_indices[:0]
 
@@ -1435,6 +1576,7 @@ def train(config_path, device="cuda"):
     cfg = meta_cfg.MODEL
     augmentation_cfg = _cfg_get(meta_cfg, "AUGMENTATION", None)
     proxy_cfg = _cfg_get(meta_cfg, "PROXY_TARGET", None)
+    loss_cfg = _cfg_get(meta_cfg, "LOSS", None)
     checkpoint_steps = set(resolve_checkpoint_steps(cfg))
     loss_modules = build_loss_modules(meta_cfg, cfg)
     aux_heads = required_aux_heads(loss_modules, cfg)
@@ -1477,7 +1619,8 @@ def train(config_path, device="cuda"):
     warmstart_checkpoint = _cfg_get(cfg, "WARMSTART_CHECKPOINT", None)
     if warmstart_checkpoint:
         load_warmstart_checkpoint(model, warmstart_checkpoint, device)
-    gaussian_runtime_state = initialize_gaussian_runtime_state(model)
+    lite_sparse_mode = is_vsurface_lite_stage(config_path)
+    gaussian_runtime_state = initialize_gaussian_runtime_state(model) if requires_gaussian_runtime_state(sparse_cfg, topology_cfg) else None
     print(f"Initialized {model.num_gaussians} Gaussians")
     freeze_geometry = bool(_cfg_get(cfg, "FREEZE_GEOMETRY", False))
     frozen_geometry_keys = {"means", "quats", "scales"} if freeze_geometry else set()
@@ -1546,9 +1689,7 @@ def train(config_path, device="cuda"):
         stage_dir = Path(config_path).resolve().parent.name
         with open(sparse_diag_path, "w", encoding="utf-8") as handle:
             handle.write(f"# Sparse signal diagnostics for config/{stage_dir}\n")
-        append_json_txt_record(
-            sparse_diag_path,
-            {
+        header_payload = {
                 "record_type": "header",
                 "config_path": str(Path(config_path).resolve()),
                 "scene": str(meta_cfg.DATASET.NAME),
@@ -1567,6 +1708,10 @@ def train(config_path, device="cuda"):
                 "reproj_threshold": sparse_load_info.get("reproj_threshold"),
                 "brightness_score_mean": float(sparse_load_info.get("brightness_score_mean", 1.0)),
                 "gradient_score_mean": float(sparse_load_info.get("gradient_score_mean", 1.0)),
+                "loss_support_use_brightness": int(bool(_cfg_get(sparse_cfg, "LOSS_SUPPORT_USE_BRIGHTNESS", True))),
+                "loss_support_use_gradient": int(bool(_cfg_get(sparse_cfg, "LOSS_SUPPORT_USE_GRADIENT", True))),
+                "prune_support_use_brightness": int(bool(_cfg_get(sparse_cfg, "PRUNE_SUPPORT_USE_BRIGHTNESS", True))),
+                "prune_support_use_gradient": int(bool(_cfg_get(sparse_cfg, "PRUNE_SUPPORT_USE_GRADIENT", True))),
                 "sampling_mode": str(_cfg_get(sparse_cfg, "SAMPLING_MODE", "random")),
                 "sparse_mode": str(_cfg_get(sparse_cfg, "MODE", "point_to_barycenter")),
                 "hard_ratio": float(_cfg_get(sparse_cfg, "HARD_RATIO", 0.5)),
@@ -1635,6 +1780,16 @@ def train(config_path, device="cuda"):
                 "difficulty_orientation_weight": float(_cfg_get(sparse_cfg, "DIFFICULTY_ORIENTATION_WEIGHT", 0.5)),
                 "difficulty_scale_weight": float(_cfg_get(sparse_cfg, "DIFFICULTY_SCALE_WEIGHT", 1.0)),
                 "difficulty_normal_weight": float(_cfg_get(sparse_cfg, "DIFFICULTY_NORMAL_WEIGHT", 0.5)),
+                "mid_hard_distance_q_low": float(_cfg_get(sparse_cfg, "MID_HARD_DISTANCE_Q_LOW", 0.40)),
+                "mid_hard_distance_q_high": float(_cfg_get(sparse_cfg, "MID_HARD_DISTANCE_Q_HIGH", 0.90)),
+                "mid_hard_normal_weight": float(_cfg_get(sparse_cfg, "MID_HARD_NORMAL_WEIGHT", 1.0)),
+                "mid_hard_tangent_weight": float(_cfg_get(sparse_cfg, "MID_HARD_TANGENT_WEIGHT", 0.25)),
+                "mid_hard_orientation_weight": float(_cfg_get(sparse_cfg, "MID_HARD_ORIENTATION_WEIGHT", 0.5)),
+                "mid_hard_scale_weight": float(_cfg_get(sparse_cfg, "MID_HARD_SCALE_WEIGHT", 0.5)),
+                "mid_hard_opacity_weight_power": float(_cfg_get(sparse_cfg, "MID_HARD_OPACITY_WEIGHT_POWER", 0.5)),
+                "mid_hard_candidate_subset_ratio": float(_cfg_get(sparse_cfg, "MID_HARD_CANDIDATE_SUBSET_RATIO", 1.0)),
+                "mid_hard_candidate_subset_min": int(_cfg_get(sparse_cfg, "MID_HARD_CANDIDATE_SUBSET_MIN", 0)),
+                "mid_hard_candidate_subset_max": int(_cfg_get(sparse_cfg, "MID_HARD_CANDIDATE_SUBSET_MAX", 0)),
                 "weight_schedule": str(_cfg_get(sparse_cfg, "WEIGHT_SCHEDULE", "constant")),
                 "weight_start_scale": float(_cfg_get(sparse_cfg, "WEIGHT_START_SCALE", 1.0)),
                 "weight_end_scale": float(_cfg_get(sparse_cfg, "WEIGHT_END_SCALE", 1.0)),
@@ -1671,6 +1826,9 @@ def train(config_path, device="cuda"):
                 "coverage_radius_max_scale": float(_cfg_get(topology_cfg, "COVERAGE_RADIUS_MAX_SCALE", 1.25)) if topology_enabled else 0.0,
                 "spawn_feature_init_mode": str(_cfg_get(topology_cfg, "SEED_FEATURE_INIT", "nearest_gaussian_copy")) if topology_enabled else "disabled",
                 "spawn_feature_k": int(_cfg_get(topology_cfg, "SPAWN_FEATURE_K", 4)) if topology_enabled else 0,
+                "spawn_active_density_k": int(_cfg_get(topology_cfg, "SPAWN_ACTIVE_DENSITY_K", _cfg_get(topology_cfg, "SPAWN_SUPPORT_K", 8))) if topology_enabled else 0,
+                "spawn_active_density_radius_scale": float(_cfg_get(topology_cfg, "SPAWN_ACTIVE_DENSITY_RADIUS_SCALE", 2.5)) if topology_enabled else 0.0,
+                "spawn_density_deficit_weight": float(_cfg_get(topology_cfg, "SPAWN_DENSITY_DEFICIT_WEIGHT", 1.0)) if topology_enabled else 0.0,
                 "surface_coupling_enabled": int(bool(_cfg_get(topology_cfg, "SURFACE_COUPLING_ENABLED", False))) if topology_enabled else 0,
                 "spawn_surface_score_weight": float(_cfg_get(topology_cfg, "SPAWN_SURFACE_SCORE_WEIGHT", 0.0)) if topology_enabled else 0.0,
                 "spawn_surface_additive_weight": float(_cfg_get(topology_cfg, "SPAWN_SURFACE_ADDITIVE_WEIGHT", 0.0)) if topology_enabled else 0.0,
@@ -1683,8 +1841,39 @@ def train(config_path, device="cuda"):
                 "prune_surface_score_weight": float(_cfg_get(topology_cfg, "PRUNE_SURFACE_SCORE_WEIGHT", 0.0)) if topology_enabled else 0.0,
                 "surface_score_normal_weight": float(_cfg_get(topology_cfg, "SURFACE_SCORE_NORMAL_WEIGHT", 0.0)) if topology_enabled else 0.0,
                 "surface_score_scale_weight": float(_cfg_get(topology_cfg, "SURFACE_SCORE_SCALE_WEIGHT", 0.0)) if topology_enabled else 0.0,
-            },
-        )
+            }
+        append_json_txt_record(sparse_diag_path, filter_sparse_diag_payload(header_payload, lite_sparse_mode))
+    stage6_diag_enabled = should_write_stage6_diagnostics(config_path, has_reconstruction)
+    stage6_diag_interval = 500
+    stage6_diag_path = os.path.join(output_dir, "brightness_signal_diagnostics.txt")
+    stage6_diag_records = []
+    if stage6_diag_enabled:
+        stage_dir = Path(config_path).resolve().parent.name
+        with open(stage6_diag_path, "w", encoding="utf-8") as handle:
+            handle.write(f"# Stage6 brightness diagnostics for config/{stage_dir}\n")
+        stage6_header_payload = {
+            "record_type": "header",
+            "config_path": str(Path(config_path).resolve()),
+            "scene": str(meta_cfg.DATASET.NAME),
+            "output_dir": str(Path(output_dir).resolve()),
+            "interval": int(stage6_diag_interval),
+            "warmstart_checkpoint": str(_cfg_get(cfg, "WARMSTART_CHECKPOINT", "")),
+            "freeze_geometry": int(bool(_cfg_get(cfg, "FREEZE_GEOMETRY", False))),
+            "lambda_recon_y": float(_cfg_get(loss_cfg, "LAMBDA_RECON_Y", 0.0)),
+            "lambda_recon_cbcr": float(_cfg_get(loss_cfg, "LAMBDA_RECON_CBCR", 0.0)),
+            "lambda_chroma_reg": float(_cfg_get(loss_cfg, "LAMBDA_CHROMA_REG", 0.0)),
+            "lambda_low_light": float(_cfg_get(loss_cfg, "LAMBDA_LOW_LIGHT", 0.0)),
+            "lambda_exposure": float(_cfg_get(loss_cfg, "LAMBDA_EXPOSURE", 0.0)),
+            "augmentation_mode": str(_cfg_get(augmentation_cfg, "MODE", "unknown")),
+            "augmentation_target_mean": float(_cfg_get(augmentation_cfg, "TARGET_MEAN", 0.0)),
+            "proxy_form": str(_cfg_get(proxy_cfg, "FORM", "disabled")),
+            "proxy_target_mean_base": float(_cfg_get(proxy_cfg, "TARGET_MEAN", 0.0)),
+            "proxy_stat_mode": str(_cfg_get(proxy_cfg, "STAT_MODE", "unknown")),
+            "proxy_calibration_mode": str(_cfg_get(proxy_cfg, "CALIBRATION_MODE", "unknown")),
+            "proxy_shadow_threshold": float(_cfg_get(proxy_cfg, "SHADOW_THRESHOLD", 0.0)),
+            "proxy_shadow_power": float(_cfg_get(proxy_cfg, "SHADOW_POWER", 0.0)),
+        }
+        append_json_txt_record(stage6_diag_path, stage6_header_payload)
     pbar = tqdm(range(total_steps))
     for step in pbar:
         current_step = step + 1
@@ -1734,8 +1923,8 @@ def train(config_path, device="cuda"):
             "gaussian_quats": model.splats["quats"],
             "gaussian_scales": model.splats["scales"],
             "gaussian_opacities": model.splats["opacities"],
-            "gaussian_birth_step": gaussian_runtime_state["gaussian_birth_step"],
-            "gaussian_render_confidence": gaussian_runtime_state["gaussian_render_confidence"],
+            "gaussian_birth_step": None if gaussian_runtime_state is None else gaussian_runtime_state["gaussian_birth_step"],
+            "gaussian_render_confidence": None if gaussian_runtime_state is None else gaussian_runtime_state["gaussian_render_confidence"],
             "depth_aux": render_outputs["depth_aux"],
             "geom_depth": render_outputs["geom_depth"],
             "alphas": render_outputs["alphas"],
@@ -1768,6 +1957,7 @@ def train(config_path, device="cuda"):
             "structure": data["structure"].to(device) if data["structure"] is not None else None,
         }
         capture_sparse_diag = sparse_diag_enabled and (current_step % sparse_diag_interval == 0 or current_step == total_steps)
+        capture_stage6_diag = stage6_diag_enabled and (current_step % stage6_diag_interval == 0 or current_step == total_steps)
         loss_details = None
         if capture_sparse_diag:
             loss, loss_logs, loss_details = compute_loss_modules(loss_modules, context, return_details=True)
@@ -1786,6 +1976,7 @@ def train(config_path, device="cuda"):
         loss_logs["neighbor_distance"] = float(neighbor_distance)
         loss_logs["chroma_available"] = float(render_outputs.get("chroma_aux") is not None)
         sparse_diag_snapshot = None
+        stage6_diag_snapshot = None
         topology_event_info = {
             "topology_event": 0,
             "spawn_count": 0,
@@ -1816,6 +2007,57 @@ def train(config_path, device="cuda"):
             "prune_render_protected_ratio": 0.0,
             "prune_render_filtered_count": 0,
         }
+
+        if capture_stage6_diag:
+            with torch.no_grad():
+                base_target = context["supervision_hwc"]
+                base_render = context["rgb_base_hwc"] if has_reconstruction else context["rendered"]
+                recon_target = context["proxy_target_hwc"] if has_reconstruction else base_target
+                recon_render = context["recon_hwc"] if has_reconstruction else base_render
+                mse_base = ((base_render - base_target) ** 2).mean()
+                mse_recon = ((recon_render - recon_target) ** 2).mean()
+                psnr_base = -10.0 * math.log10(mse_base.clamp_min(1.0e-10).item())
+                psnr_recon = -10.0 * math.log10(mse_recon.clamp_min(1.0e-10).item())
+                stage6_diag_snapshot = {
+                    "record_type": "snapshot",
+                    "step": int(current_step),
+                    "final_step": int(current_step == total_steps),
+                    "num_gaussians": int(model.num_gaussians),
+                    "rgb_base_loss": float(loss_logs.get("rgb_base", loss_logs.get("rgb", 0.0))),
+                    "luminance_reconstruction_loss": float(loss_logs.get("luminance_reconstruction", 0.0)),
+                    "chroma_reconstruction_loss": float(loss_logs.get("chroma_reconstruction", 0.0)),
+                    "chroma_regularization_loss": float(loss_logs.get("chroma_reg", 0.0)),
+                    "luminance_weight_mean": float(loss_logs.get("luminance_reconstruction_weight_mean", 1.0)),
+                    "chroma_weight_mean": float(loss_logs.get("chroma_reconstruction_weight_mean", 1.0)),
+                    "psnr_base": float(psnr_base),
+                    "psnr_recon": float(psnr_recon),
+                    "low_mean": float(train_batch["low_mean"]),
+                    "supervision_y_mean": float(rgb_hwc_luma_mean(base_target)),
+                    "rgb_base_y_mean": float(rgb_hwc_luma_mean(base_render)),
+                    "recon_y_mean": float(rgb_hwc_luma_mean(recon_render)),
+                    "proxy_mean": float(train_batch["proxy_mean"]),
+                    "proxy_stat_mean": float(train_batch["proxy_stat_mean"]),
+                    "proxy_gain": float(train_batch["proxy_scale"]),
+                    "proxy_form": str(train_batch["proxy_form"]),
+                    "proxy_global_mean": float(train_batch["proxy_global_mean"]),
+                    "proxy_shadow_mean": float(train_batch["proxy_shadow_mean"]),
+                    "proxy_shadow_weight_mean": float(train_batch["proxy_shadow_weight_mean"]),
+                    "proxy_target_mean": float(train_batch["proxy_target_mean"]),
+                    "proxy_base_target_mean": float(train_batch["proxy_base_target_mean"]),
+                    "proxy_calibration_scale": float(train_batch["proxy_calibration_scale"]),
+                    "proxy_stat_scale": float(train_batch["proxy_stat_scale"]),
+                    "proxy_highlight_scale": float(train_batch["proxy_highlight_scale"]),
+                    "proxy_highlight_value": float(train_batch["proxy_highlight_value"]),
+                    "proxy_calibration_mode": str(train_batch["proxy_calibration_mode"]),
+                    "target_mean": float(train_batch["target_mean"]),
+                    "illumination_available": int(render_outputs["illum_aux"] is not None),
+                    "chroma_available": int(render_outputs.get("chroma_aux") is not None),
+                    "lr_opacities_current": float(optimizers["opacities"].param_groups[0]["lr"]) if "opacities" in optimizers and optimizers["opacities"].param_groups else 0.0,
+                    "lr_sh0_current": float(optimizers["sh0"].param_groups[0]["lr"]) if "sh0" in optimizers and optimizers["sh0"].param_groups else 0.0,
+                    "lr_shn_current": float(optimizers["shN"].param_groups[0]["lr"]) if "shN" in optimizers and optimizers["shN"].param_groups else 0.0,
+                    "lr_illum_current": float(optimizers["illum_feat"].param_groups[0]["lr"]) if "illum_feat" in optimizers and optimizers["illum_feat"].param_groups else 0.0,
+                    "lr_chroma_current": float(optimizers["chroma_feat"].param_groups[0]["lr"]) if "chroma_feat" in optimizers and optimizers["chroma_feat"].param_groups else 0.0,
+                }
 
         if strategy is not None:
             strategy.step_pre_backward(model.splats, optimizers, strategy_state, step, render_outputs["info"])
@@ -1869,6 +2111,14 @@ def train(config_path, device="cuda"):
                 "sparse_support_p10": float(loss_logs.get("sparse_guided_support_score_p10", 0.0)),
                 "sparse_support_p50": float(loss_logs.get("sparse_guided_support_score_p50", 0.0)),
                 "sparse_support_p90": float(loss_logs.get("sparse_guided_support_score_p90", 0.0)),
+                "loss_support_mean": float(loss_logs.get("sparse_guided_loss_support_score_mean", 0.0)),
+                "prune_support_mean": float(loss_logs.get("sparse_guided_prune_support_score_mean", 0.0)),
+                "loss_support_p10": float(loss_logs.get("sparse_guided_loss_support_score_p10", 0.0)),
+                "loss_support_p50": float(loss_logs.get("sparse_guided_loss_support_score_p50", 0.0)),
+                "loss_support_p90": float(loss_logs.get("sparse_guided_loss_support_score_p90", 0.0)),
+                "prune_support_p10": float(loss_logs.get("sparse_guided_prune_support_score_p10", 0.0)),
+                "prune_support_p50": float(loss_logs.get("sparse_guided_prune_support_score_p50", 0.0)),
+                "prune_support_p90": float(loss_logs.get("sparse_guided_prune_support_score_p90", 0.0)),
                 "sampling_mode": loss_logs.get("sparse_guided_sampling_mode", "unknown"),
                 "sparse_mode": loss_logs.get("sparse_guided_mode", "unknown"),
                 "hard_ratio": float(loss_logs.get("sparse_guided_hard_ratio", 0.0)),
@@ -1879,6 +2129,15 @@ def train(config_path, device="cuda"):
                 "difficulty_mean": float(loss_logs.get("sparse_guided_difficulty_mean", 0.0)),
                 "difficulty_p50": float(loss_logs.get("sparse_guided_difficulty_p50", 0.0)),
                 "difficulty_p90": float(loss_logs.get("sparse_guided_difficulty_p90", 0.0)),
+                "mid_hard_candidate_ratio": float(loss_logs.get("sparse_guided_mid_hard_candidate_ratio", 0.0)),
+                "mid_hard_distance_q_low": float(loss_logs.get("sparse_guided_mid_hard_distance_q_low", 0.0)),
+                "mid_hard_distance_q_high": float(loss_logs.get("sparse_guided_mid_hard_distance_q_high", 0.0)),
+                "mid_hard_band_distance_mean": float(loss_logs.get("sparse_guided_mid_hard_band_distance_mean", 0.0)),
+                "mid_hard_score_mean": float(loss_logs.get("sparse_guided_mid_hard_score_mean", 0.0)),
+                "mid_hard_score_p50": float(loss_logs.get("sparse_guided_mid_hard_score_p50", 0.0)),
+                "mid_hard_score_p90": float(loss_logs.get("sparse_guided_mid_hard_score_p90", 0.0)),
+                "mid_hard_scan_candidate_count": float(loss_logs.get("sparse_guided_mid_hard_scan_candidate_count", 0.0)),
+                "mid_hard_scan_candidate_ratio": float(loss_logs.get("sparse_guided_mid_hard_scan_candidate_ratio", 0.0)),
                 "brightness_p10": float(loss_logs.get("sparse_guided_brightness_score_p10", 0.0)),
                 "brightness_p50": float(loss_logs.get("sparse_guided_brightness_score_p50", 0.0)),
                 "brightness_p90": float(loss_logs.get("sparse_guided_brightness_score_p90", 0.0)),
@@ -1991,16 +2250,21 @@ def train(config_path, device="cuda"):
                 "prune_render_protected_ratio": float(topology_record.get("prune_render_protected_ratio", topology_event_info["prune_render_protected_ratio"])),
                 "prune_render_filtered_count": int(topology_record.get("prune_render_filtered_count", topology_event_info["prune_render_filtered_count"])),
             })
-            topology_diag_records.append(topology_record)
+            filtered_topology_record = filter_sparse_diag_payload(topology_record, lite_sparse_mode)
+            topology_diag_records.append(filtered_topology_record)
             if sparse_diag_enabled:
-                append_json_txt_record(sparse_diag_path, topology_record)
+                append_json_txt_record(sparse_diag_path, filtered_topology_record)
         topology_event_info["num_gaussians_after"] = int(model.num_gaussians)
         if sparse_diag_snapshot is not None:
             sparse_diag_snapshot.update(topology_event_info)
             sparse_diag_snapshot["num_gaussians"] = int(model.num_gaussians)
         if sparse_diag_snapshot is not None:
-            sparse_diag_records.append(sparse_diag_snapshot)
-            append_json_txt_record(sparse_diag_path, sparse_diag_snapshot)
+            filtered_sparse_diag_snapshot = filter_sparse_diag_payload(sparse_diag_snapshot, lite_sparse_mode)
+            sparse_diag_records.append(filtered_sparse_diag_snapshot)
+            append_json_txt_record(sparse_diag_path, filtered_sparse_diag_snapshot)
+        if stage6_diag_snapshot is not None:
+            stage6_diag_records.append(stage6_diag_snapshot)
+            append_json_txt_record(stage6_diag_path, stage6_diag_snapshot)
         if step % cfg.LOG_INTERVAL_STEP == 0:
             with torch.no_grad():
                 base_target = context["supervision_hwc"]
@@ -2081,6 +2345,10 @@ def train(config_path, device="cuda"):
         topology_summary = summarize_topology_records(topology_diag_records, final_num_gaussians=int(model.num_gaussians))
         if topology_summary is not None:
             append_json_txt_record(sparse_diag_path, topology_summary)
+    if stage6_diag_enabled:
+        stage6_summary = summarize_stage6_records(stage6_diag_records)
+        if stage6_summary is not None:
+            append_json_txt_record(stage6_diag_path, stage6_summary)
 
 
 if __name__ == "__main__":
