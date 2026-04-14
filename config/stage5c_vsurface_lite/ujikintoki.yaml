@@ -1,6 +1,6 @@
 DATASET:
   NAME: Ujikintoki
-  DATA_PATH: dataset/Development/lowlight_development/development/Ujikintoki
+  DATA_PATH: dataset/Test/lowlight_test/test/Ujikintoki
   BACKGROUND_COLOR: 255.0
   AUXILIARY_DIR: auxiliaries
 SEED: 3407

@@ -83,6 +83,8 @@ def build_loss_modules(meta_cfg, model_cfg):
                 structure_power=float(_cfg_get(loss_cfg, "RECON_STRUCTURE_POWER", 1.0)),
                 weight_min=float(_cfg_get(loss_cfg, "RECON_WEIGHT_MIN", 0.25)),
                 weight_max=float(_cfg_get(loss_cfg, "RECON_WEIGHT_MAX", 2.0)),
+                anchor_weight=float(_cfg_get(loss_cfg, "RECON_Y_ANCHOR_WEIGHT", 0.0)),
+                anchor_shadow_alpha=float(_cfg_get(loss_cfg, "RECON_Y_ANCHOR_SHADOW_ALPHA", 0.0)),
             ),
             ChromaReconstructionLoss(
                 weight=lambda_recon_cbcr,

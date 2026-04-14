@@ -1,6 +1,6 @@
 DATASET:
   NAME: MilkCookie
-  DATA_PATH: dataset/Development/lowlight_development/development/MilkCookie
+  DATA_PATH: dataset/Test/lowlight_test/test/MilkCookie
   BACKGROUND_COLOR: 255.0
   AUXILIARY_DIR: auxiliaries
 SEED: 3407

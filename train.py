@@ -217,25 +217,31 @@ def summarize_stage6_records(records):
         "last_step": int(records[-1]["step"]),
         "mean_rgb_base_loss": mean_value("rgb_base_loss"),
         "mean_luminance_reconstruction_loss": mean_value("luminance_reconstruction_loss"),
+        "mean_luminance_anchor_loss": mean_value("luminance_anchor_loss"),
         "mean_chroma_reconstruction_loss": mean_value("chroma_reconstruction_loss"),
         "mean_psnr_base": mean_value("psnr_base"),
         "mean_psnr_recon": mean_value("psnr_recon"),
         "mean_low_mean": mean_value("low_mean"),
         "mean_proxy_mean": mean_value("proxy_mean"),
+        "mean_proxy_y_mean": mean_value("proxy_y_mean"),
         "mean_proxy_target_mean": mean_value("proxy_target_mean"),
         "mean_proxy_gain": mean_value("proxy_gain"),
+        "mean_proxy_post_match_scale": mean_value("proxy_post_match_scale"),
         "mean_proxy_shadow_weight_mean": mean_value("proxy_shadow_weight_mean"),
         "mean_rgb_base_y_mean": mean_value("rgb_base_y_mean"),
         "mean_recon_y_mean": mean_value("recon_y_mean"),
         "final_rgb_base_loss": float(last_record.get("rgb_base_loss", 0.0)),
         "final_luminance_reconstruction_loss": float(last_record.get("luminance_reconstruction_loss", 0.0)),
+        "final_luminance_anchor_loss": float(last_record.get("luminance_anchor_loss", 0.0)),
         "final_chroma_reconstruction_loss": float(last_record.get("chroma_reconstruction_loss", 0.0)),
         "final_psnr_base": float(last_record.get("psnr_base", 0.0)),
         "final_psnr_recon": float(last_record.get("psnr_recon", 0.0)),
         "final_low_mean": float(last_record.get("low_mean", 0.0)),
         "final_proxy_mean": float(last_record.get("proxy_mean", 0.0)),
+        "final_proxy_y_mean": float(last_record.get("proxy_y_mean", 0.0)),
         "final_proxy_target_mean": float(last_record.get("proxy_target_mean", 0.0)),
         "final_proxy_gain": float(last_record.get("proxy_gain", 0.0)),
+        "final_proxy_post_match_scale": float(last_record.get("proxy_post_match_scale", 0.0)),
         "final_proxy_shadow_weight_mean": float(last_record.get("proxy_shadow_weight_mean", 0.0)),
         "final_rgb_base_y_mean": float(last_record.get("rgb_base_y_mean", 0.0)),
         "final_recon_y_mean": float(last_record.get("recon_y_mean", 0.0)),
@@ -1864,6 +1870,8 @@ def train(config_path, device="cuda"):
             "lambda_chroma_reg": float(_cfg_get(loss_cfg, "LAMBDA_CHROMA_REG", 0.0)),
             "lambda_low_light": float(_cfg_get(loss_cfg, "LAMBDA_LOW_LIGHT", 0.0)),
             "lambda_exposure": float(_cfg_get(loss_cfg, "LAMBDA_EXPOSURE", 0.0)),
+            "recon_y_anchor_weight": float(_cfg_get(loss_cfg, "RECON_Y_ANCHOR_WEIGHT", 0.0)),
+            "recon_y_anchor_shadow_alpha": float(_cfg_get(loss_cfg, "RECON_Y_ANCHOR_SHADOW_ALPHA", 0.0)),
             "augmentation_mode": str(_cfg_get(augmentation_cfg, "MODE", "unknown")),
             "augmentation_target_mean": float(_cfg_get(augmentation_cfg, "TARGET_MEAN", 0.0)),
             "proxy_form": str(_cfg_get(proxy_cfg, "FORM", "disabled")),
@@ -1872,6 +1880,9 @@ def train(config_path, device="cuda"):
             "proxy_calibration_mode": str(_cfg_get(proxy_cfg, "CALIBRATION_MODE", "unknown")),
             "proxy_shadow_threshold": float(_cfg_get(proxy_cfg, "SHADOW_THRESHOLD", 0.0)),
             "proxy_shadow_power": float(_cfg_get(proxy_cfg, "SHADOW_POWER", 0.0)),
+            "proxy_post_match_y_mean_enabled": int(bool(_cfg_get(proxy_cfg, "POST_MATCH_Y_MEAN_ENABLED", True))),
+            "proxy_post_match_search_steps": int(_cfg_get(proxy_cfg, "POST_MATCH_SEARCH_STEPS", 12)),
+            "proxy_post_match_max_gain": float(_cfg_get(proxy_cfg, "POST_MATCH_MAX_GAIN", _cfg_get(proxy_cfg, "MAX_GAIN", 1.0))),
         }
         append_json_txt_record(stage6_diag_path, stage6_header_payload)
     pbar = tqdm(range(total_steps))
@@ -1944,6 +1955,7 @@ def train(config_path, device="cuda"):
             "proxy_shadow_weight_hwc": train_batch["proxy_shadow_weight"],
             "reference_hwc": reference_image.permute(1, 2, 0),
             "proxy_target_hwc": proxy_target_image.permute(1, 2, 0),
+            "proxy_target_mean": float(train_batch["proxy_target_mean"]),
             "base_lit_rgb": render_outputs.get("base_lit_rgb"),
             "target_mean": train_batch["target_mean"],
             "data": data,
@@ -1971,6 +1983,11 @@ def train(config_path, device="cuda"):
         loss_logs["proxy_global_mean"] = float(train_batch["proxy_global_mean"])
         loss_logs["proxy_shadow_mean"] = float(train_batch["proxy_shadow_mean"])
         loss_logs["proxy_blend_mean"] = float(train_batch["proxy_blend_mean"])
+        loss_logs["proxy_y_mean"] = float(train_batch["proxy_y_mean"])
+        loss_logs["proxy_global_y_mean"] = float(train_batch["proxy_global_y_mean"])
+        loss_logs["proxy_shadow_y_mean"] = float(train_batch["proxy_shadow_y_mean"])
+        loss_logs["proxy_blend_y_mean"] = float(train_batch["proxy_blend_y_mean"])
+        loss_logs["proxy_post_match_scale"] = float(train_batch["proxy_post_match_scale"])
         loss_logs["proxy_shadow_weight_mean"] = float(train_batch["proxy_shadow_weight_mean"])
         loss_logs["low_mean"] = float(train_batch["low_mean"])
         loss_logs["neighbor_distance"] = float(neighbor_distance)
@@ -2025,6 +2042,11 @@ def train(config_path, device="cuda"):
                     "num_gaussians": int(model.num_gaussians),
                     "rgb_base_loss": float(loss_logs.get("rgb_base", loss_logs.get("rgb", 0.0))),
                     "luminance_reconstruction_loss": float(loss_logs.get("luminance_reconstruction", 0.0)),
+                    "luminance_anchor_loss": float(loss_logs.get("luminance_reconstruction_anchor", 0.0)),
+                    "luminance_anchor_weight": float(loss_logs.get("luminance_reconstruction_anchor_weight", 0.0)),
+                    "luminance_anchor_pred_mean": float(loss_logs.get("luminance_reconstruction_anchor_pred_mean", 0.0)),
+                    "luminance_anchor_target_mean": float(loss_logs.get("luminance_reconstruction_anchor_target_mean", 0.0)),
+                    "luminance_anchor_weight_mean": float(loss_logs.get("luminance_reconstruction_anchor_weight_mean", 1.0)),
                     "chroma_reconstruction_loss": float(loss_logs.get("chroma_reconstruction", 0.0)),
                     "chroma_regularization_loss": float(loss_logs.get("chroma_reg", 0.0)),
                     "luminance_weight_mean": float(loss_logs.get("luminance_reconstruction_weight_mean", 1.0)),
@@ -2036,11 +2058,16 @@ def train(config_path, device="cuda"):
                     "rgb_base_y_mean": float(rgb_hwc_luma_mean(base_render)),
                     "recon_y_mean": float(rgb_hwc_luma_mean(recon_render)),
                     "proxy_mean": float(train_batch["proxy_mean"]),
+                    "proxy_y_mean": float(train_batch["proxy_y_mean"]),
                     "proxy_stat_mean": float(train_batch["proxy_stat_mean"]),
                     "proxy_gain": float(train_batch["proxy_scale"]),
                     "proxy_form": str(train_batch["proxy_form"]),
                     "proxy_global_mean": float(train_batch["proxy_global_mean"]),
                     "proxy_shadow_mean": float(train_batch["proxy_shadow_mean"]),
+                    "proxy_global_y_mean": float(train_batch["proxy_global_y_mean"]),
+                    "proxy_shadow_y_mean": float(train_batch["proxy_shadow_y_mean"]),
+                    "proxy_blend_y_mean": float(train_batch["proxy_blend_y_mean"]),
+                    "proxy_post_match_scale": float(train_batch["proxy_post_match_scale"]),
                     "proxy_shadow_weight_mean": float(train_batch["proxy_shadow_weight_mean"]),
                     "proxy_target_mean": float(train_batch["proxy_target_mean"]),
                     "proxy_base_target_mean": float(train_batch["proxy_base_target_mean"]),

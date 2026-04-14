@@ -9,7 +9,7 @@ import torch.nn as nn
 from PIL import Image
 from gsplat import rasterization
 
-from core.libs.losses import apply_ycbcr_chroma_residual, apply_ycbcr_luminance_gain
+from core.libs.losses import apply_ycbcr_chroma_residual, apply_ycbcr_luminance_gain, illum_delta_from_aux
 
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".JPG", ".JPEG")
@@ -931,8 +931,8 @@ class Simple3DGS(nn.Module):
         chroma_delta = None
         base_lit_ycbcr = None
         if illum_aux is not None and rgb is not None:
-            illum_factor = 2.0 * torch.sigmoid(illum_aux)
-            base_lit_rgb, base_lit_ycbcr = apply_ycbcr_luminance_gain(rgb, illum_factor)
+            illum_delta = illum_delta_from_aux(illum_aux)
+            base_lit_rgb, base_lit_ycbcr = apply_ycbcr_luminance_gain(rgb, illum_delta)
         else:
             base_lit_rgb = rgb
         if chroma_aux is not None and base_lit_rgb is not None and self.chroma_residual_enabled:

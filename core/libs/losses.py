@@ -1,4 +1,7 @@
+import math
+
 import torch
+import torch.nn.functional as F
 
 from .utils import ssim
 
@@ -22,9 +25,16 @@ def ycbcr_to_rgb_hwc(ycbcr_hwc):
     return torch.stack([r, g, b], dim=-1)
 
 
-def apply_ycbcr_luminance_gain(rgb_hwc, illum_factor):
+def illum_delta_from_aux(illum_aux):
+    raw_delta = F.softplus(illum_aux) - math.log(2.0)
+    return raw_delta.clamp(0.0, 1.0)
+
+
+def apply_ycbcr_luminance_gain(rgb_hwc, illum_delta):
     ycbcr = rgb_to_ycbcr_hwc(rgb_hwc)
-    y = torch.clamp(ycbcr[..., 0] * illum_factor.squeeze(-1), 0.0, 1.0)
+    y = ycbcr[..., 0]
+    delta = illum_delta.squeeze(-1)
+    y = torch.clamp(y + delta * (1.0 - y), 0.0, 1.0)
     adjusted_ycbcr = torch.stack([y, ycbcr[..., 1], ycbcr[..., 2]], dim=-1)
     base_lit_rgb = torch.clamp(ycbcr_to_rgb_hwc(adjusted_ycbcr), 0.0, 1.0)
     return base_lit_rgb, adjusted_ycbcr

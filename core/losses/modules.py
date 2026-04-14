@@ -4,6 +4,7 @@ from core.libs.losses import (
     chroma_delta_from_aux,
     chroma_factor_from_aux,
     exposure_control_loss,
+    illum_delta_from_aux,
     low_light_consistency_loss,
     rgb_to_ycbcr_hwc,
     rgb_reconstruction_loss,
@@ -199,6 +200,8 @@ class LuminanceReconstructionLoss(BaseLossModule):
         structure_power=1.0,
         weight_min=0.25,
         weight_max=2.0,
+        anchor_weight=0.0,
+        anchor_shadow_alpha=0.0,
     ):
         super().__init__(name="luminance_reconstruction", weight=weight, enabled=weight > 0.0, start_step=start_step)
         self.input_key = str(input_key)
@@ -211,6 +214,8 @@ class LuminanceReconstructionLoss(BaseLossModule):
         self.structure_power = float(structure_power)
         self.weight_min = float(weight_min)
         self.weight_max = float(weight_max)
+        self.anchor_weight = float(max(anchor_weight, 0.0))
+        self.anchor_shadow_alpha = float(max(anchor_shadow_alpha, 0.0))
 
     def _build_weight_map(self, context, target):
         weight_map = torch.ones(target.shape[:2], device=target.device, dtype=target.dtype)
@@ -223,6 +228,13 @@ class LuminanceReconstructionLoss(BaseLossModule):
         weight_map = weight_map * build_structure_confidence(context, target, self.confidence_floor, self.structure_power)
         return normalize_weight_map(weight_map, self.weight_min, self.weight_max)
 
+    def _weighted_mean(self, values, weight_map):
+        values = values.squeeze(-1)
+        if weight_map is None:
+            return values.mean()
+        weights = weight_map.to(device=values.device, dtype=values.dtype)
+        return (values * weights).sum() / weights.sum().clamp_min(1.0e-6)
+
     def compute(self, context):
         target = context.get(self.target_key)
         if target is None:
@@ -234,10 +246,28 @@ class LuminanceReconstructionLoss(BaseLossModule):
         pred_y = rgb_to_ycbcr_hwc(context[self.input_key])[..., :1]
         target_y = rgb_to_ycbcr_hwc(target)[..., :1]
         weight_map = self._build_weight_map(context, target) if self.use_weight_map else None
-        loss = weighted_l1_loss(pred_y, target_y, weight_map)
+        pixel_loss = weighted_l1_loss(pred_y, target_y, weight_map)
+        anchor_loss = torch.zeros((), device=pred_y.device, dtype=pred_y.dtype)
+        pred_anchor_mean = self._weighted_mean(pred_y, None)
+        target_anchor_scalar = context.get("proxy_target_mean")
+        if target_anchor_scalar is None:
+            target_anchor_mean = self._weighted_mean(target_y, None)
+        else:
+            target_anchor_mean = pred_y.new_tensor(float(target_anchor_scalar))
+        anchor_weight_mean = 1.0
+        if self.anchor_weight > 0.0:
+            pred_anchor_mean = self._weighted_mean(pred_y, None)
+            anchor_loss = torch.abs(pred_anchor_mean - target_anchor_mean)
+        loss = pixel_loss + self.anchor_weight * anchor_loss
         weight_mean = 1.0 if weight_map is None else float(weight_map.detach().mean().item())
         return loss, {
-            "l1": float(loss.detach().item()),
+            "l1": float(pixel_loss.detach().item()),
+            "anchor": float(anchor_loss.detach().item()),
+            "anchor_weight": float(self.anchor_weight),
+            "anchor_shadow_alpha": float(self.anchor_shadow_alpha),
+            "anchor_pred_mean": float(pred_anchor_mean.detach().item()),
+            "anchor_target_mean": float(target_anchor_mean.detach().item()),
+            "anchor_weight_mean": anchor_weight_mean,
             "active": 1.0,
             "weight_mean": weight_mean,
         }
@@ -371,9 +401,9 @@ class IlluminationRegularizationLoss(BaseLossModule):
         illum_aux = context.get("illum_aux")
         if illum_aux is None:
             raise RuntimeError("IlluminationRegularizationLoss requires illum_aux, but the model did not render the illumination head.")
-        illum_factor = 2.0 * torch.sigmoid(illum_aux)
-        loss = torch.abs(illum_factor - 1.0).mean()
-        return loss, {"factor_mean": float(illum_factor.detach().mean().item())}
+        illum_delta = illum_delta_from_aux(illum_aux)
+        loss = torch.abs(illum_delta).mean()
+        return loss, {"delta_mean": float(illum_delta.detach().mean().item())}
 
 
 class ChromaResidualRegularizationLoss(BaseLossModule):

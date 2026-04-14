@@ -15,6 +15,7 @@ from tqdm import tqdm
 from core.data import Blender
 from core.data.blender import load_img
 from core.libs import ConfigDict, ssim
+from core.libs.losses import illum_delta_from_aux
 from core.model import Simple3DGS
 
 
@@ -170,8 +171,9 @@ def save_render_outputs(render_outputs, frame_key, output_dir):
     os.makedirs(chroma_dir, exist_ok=True)
 
     base_image = render_outputs.get("base_lit_rgb", render_outputs["rgb"])
+    illum_preview = illum_delta_from_aux(illum_aux).clamp(0.0, 1.0).permute(2, 0, 1)
     save_image(base_image.permute(2, 0, 1).clamp(0, 1), os.path.join(base_dir, f"{frame_key}.png"))
-    save_image((torch.clamp(2.0 * torch.sigmoid(illum_aux), 0.0, 2.0) / 2.0).permute(2, 0, 1), os.path.join(illum_dir, f"{frame_key}.png"))
+    save_image(illum_preview, os.path.join(illum_dir, f"{frame_key}.png"))
     save_image(final_image.permute(2, 0, 1).clamp(0, 1), os.path.join(recon_dir, f"{frame_key}.png"))
     cb_preview, cr_preview = _build_chroma_preview_maps(render_outputs)
     if cb_preview is not None and cr_preview is not None:

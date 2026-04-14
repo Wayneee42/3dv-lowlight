@@ -36,6 +36,47 @@ def _compute_gray(image):
 
 
 
+def _match_proxy_luminance_mean(proxy_target, target_mean, max_gain, eps, search_steps=12):
+    proxy_target = torch.clamp(proxy_target, 0.0, 1.0)
+    target_mean = float(min(max(target_mean, 0.0), 1.0))
+    current_y_mean = float(_compute_gray(proxy_target).mean().item())
+    if abs(current_y_mean - target_mean) <= 1.0e-4:
+        return proxy_target, 1.0, current_y_mean
+
+    max_gain = float(max(max_gain, 1.0))
+    search_steps = int(max(1, search_steps))
+
+    def _apply_gain(scale):
+        scaled = torch.clamp(proxy_target * float(scale), 0.0, 1.0)
+        scaled_y_mean = float(_compute_gray(scaled).mean().item())
+        return scaled, scaled_y_mean
+
+    if current_y_mean < target_mean:
+        low_scale = 1.0
+        high_scale = max_gain
+        low_image, low_y_mean = proxy_target, current_y_mean
+        high_image, high_y_mean = _apply_gain(high_scale)
+        if high_y_mean <= target_mean + 1.0e-4:
+            return high_image, float(high_scale), high_y_mean
+    else:
+        low_scale = 0.0
+        high_scale = 1.0
+        low_image, low_y_mean = _apply_gain(low_scale)
+        high_image, high_y_mean = proxy_target, current_y_mean
+
+    for _ in range(search_steps):
+        mid_scale = 0.5 * (low_scale + high_scale)
+        mid_image, mid_y_mean = _apply_gain(mid_scale)
+        if mid_y_mean < target_mean:
+            low_scale, low_image, low_y_mean = mid_scale, mid_image, mid_y_mean
+        else:
+            high_scale, high_image, high_y_mean = mid_scale, mid_image, mid_y_mean
+
+    if abs(low_y_mean - target_mean) <= abs(high_y_mean - target_mean):
+        return low_image, float(low_scale), low_y_mean
+    return high_image, float(high_scale), high_y_mean
+
+
 def _compute_proxy_stat_mean(gray, proxy_cfg, eps):
     stat_mode = str(_cfg_get(proxy_cfg, "STAT_MODE", "mean")).lower()
 
@@ -157,6 +198,19 @@ def build_proxy_target(
             max_scale=fallback_max_scale,
             eps=float(_cfg_get(proxy_cfg, "EPS", 1e-6)),
         )
+        post_match_enabled = bool(_cfg_get(proxy_cfg, "POST_MATCH_Y_MEAN_ENABLED", True))
+        post_match_steps = int(_cfg_get(proxy_cfg, "POST_MATCH_SEARCH_STEPS", 12))
+        post_match_gain_limit = float(_cfg_get(proxy_cfg, "POST_MATCH_MAX_GAIN", fallback_max_scale))
+        proxy_y_mean = float(_compute_gray(proxy_target).mean().item())
+        post_match_scale = 1.0
+        if post_match_enabled:
+            proxy_target, post_match_scale, proxy_y_mean = _match_proxy_luminance_mean(
+                proxy_target,
+                fallback_target_mean,
+                max_gain=post_match_gain_limit,
+                eps=float(_cfg_get(proxy_cfg, "EPS", 1e-6)),
+                search_steps=post_match_steps,
+            )
         zero_weight = torch.zeros_like(gray)
         proxy_mean = float(proxy_target.mean().item())
         return {
@@ -172,6 +226,12 @@ def build_proxy_target(
             "proxy_shadow_mean": proxy_mean,
             "proxy_blend_mean": proxy_mean,
             "proxy_shadow_weight_mean": 0.0,
+            "proxy_y_mean": proxy_y_mean,
+            "proxy_global_y_mean": proxy_y_mean,
+            "proxy_shadow_y_mean": proxy_y_mean,
+            "proxy_blend_y_mean": proxy_y_mean,
+            "proxy_post_match_scale": float(post_match_scale),
+            "proxy_post_match_enabled": int(post_match_enabled),
             "proxy_target_mean": float(fallback_target_mean),
             "proxy_base_target_mean": float(fallback_target_mean),
             "proxy_calibration_scale": 1.0,
@@ -191,13 +251,29 @@ def build_proxy_target(
     target_mean = float(calibration_info["target_mean"])
     global_gain = torch.clamp(torch.tensor(target_mean, device=image.device) / stat_mean, min_gain, max_gain)
     proxy_global = torch.clamp(image * global_gain, 0.0, 1.0)
+    proxy_global_y_mean = float(_compute_gray(proxy_global).mean().item())
+    post_match_enabled = bool(_cfg_get(proxy_cfg, "POST_MATCH_Y_MEAN_ENABLED", True))
+    post_match_steps = int(_cfg_get(proxy_cfg, "POST_MATCH_SEARCH_STEPS", 12))
+    post_match_gain_limit = float(_cfg_get(proxy_cfg, "POST_MATCH_MAX_GAIN", max_gain))
 
     form = str(_cfg_get(proxy_cfg, "FORM", "global_linear")).lower()
     if form == "global_linear":
         zero_weight = torch.zeros_like(gray)
-        proxy_mean = float(proxy_global.mean().item())
+        proxy_target = proxy_global
+        proxy_blend_y_mean = float(_compute_gray(proxy_target).mean().item())
+        post_match_scale = 1.0
+        proxy_y_mean = proxy_blend_y_mean
+        if post_match_enabled:
+            proxy_target, post_match_scale, proxy_y_mean = _match_proxy_luminance_mean(
+                proxy_target,
+                target_mean,
+                max_gain=post_match_gain_limit,
+                eps=eps,
+                search_steps=post_match_steps,
+            )
+        proxy_mean = float(proxy_target.mean().item())
         return {
-            "proxy_target": proxy_global,
+            "proxy_target": proxy_target,
             "proxy_global": proxy_global,
             "proxy_shadow": proxy_global,
             "proxy_shadow_weight": zero_weight,
@@ -205,10 +281,16 @@ def build_proxy_target(
             "proxy_stat_mean": float(stat_mean.item()),
             "proxy_stat_mode": stat_label,
             "proxy_form": form,
-            "proxy_global_mean": proxy_mean,
-            "proxy_shadow_mean": proxy_mean,
-            "proxy_blend_mean": proxy_mean,
+            "proxy_global_mean": float(proxy_global.mean().item()),
+            "proxy_shadow_mean": float(proxy_global.mean().item()),
+            "proxy_blend_mean": float(proxy_global.mean().item()),
             "proxy_shadow_weight_mean": 0.0,
+            "proxy_y_mean": proxy_y_mean,
+            "proxy_global_y_mean": proxy_global_y_mean,
+            "proxy_shadow_y_mean": proxy_global_y_mean,
+            "proxy_blend_y_mean": proxy_blend_y_mean,
+            "proxy_post_match_scale": float(post_match_scale),
+            "proxy_post_match_enabled": int(post_match_enabled),
             "proxy_target_mean": target_mean,
             "proxy_base_target_mean": float(calibration_info["base_target_mean"]),
             "proxy_calibration_scale": float(calibration_info["calibration_scale"]),
@@ -239,6 +321,18 @@ def build_proxy_target(
             0.0,
             1.0,
         )
+        proxy_shadow_y_mean = float(_compute_gray(shadow_proxy).mean().item())
+        proxy_blend_y_mean = float(_compute_gray(proxy_target).mean().item())
+        post_match_scale = 1.0
+        proxy_y_mean = proxy_blend_y_mean
+        if post_match_enabled:
+            proxy_target, post_match_scale, proxy_y_mean = _match_proxy_luminance_mean(
+                proxy_target,
+                target_mean,
+                max_gain=post_match_gain_limit,
+                eps=eps,
+                search_steps=post_match_steps,
+            )
         return {
             "proxy_target": proxy_target,
             "proxy_global": proxy_global,
@@ -252,6 +346,12 @@ def build_proxy_target(
             "proxy_shadow_mean": float(shadow_proxy.mean().item()),
             "proxy_blend_mean": float(proxy_target.mean().item()),
             "proxy_shadow_weight_mean": float(shadow_weight.mean().item()),
+            "proxy_y_mean": proxy_y_mean,
+            "proxy_global_y_mean": proxy_global_y_mean,
+            "proxy_shadow_y_mean": proxy_shadow_y_mean,
+            "proxy_blend_y_mean": proxy_blend_y_mean,
+            "proxy_post_match_scale": float(post_match_scale),
+            "proxy_post_match_enabled": int(post_match_enabled),
             "proxy_target_mean": target_mean,
             "proxy_base_target_mean": float(calibration_info["base_target_mean"]),
             "proxy_calibration_scale": float(calibration_info["calibration_scale"]),
@@ -314,6 +414,12 @@ def prepare_low_light_batch(image, aug_cfg=None, training=True, proxy_cfg=None):
             "proxy_shadow_mean": float(proxy_info["proxy_shadow_mean"]),
             "proxy_blend_mean": float(proxy_info["proxy_blend_mean"]),
             "proxy_shadow_weight_mean": float(proxy_info["proxy_shadow_weight_mean"]),
+            "proxy_y_mean": float(proxy_info["proxy_y_mean"]),
+            "proxy_global_y_mean": float(proxy_info["proxy_global_y_mean"]),
+            "proxy_shadow_y_mean": float(proxy_info["proxy_shadow_y_mean"]),
+            "proxy_blend_y_mean": float(proxy_info["proxy_blend_y_mean"]),
+            "proxy_post_match_scale": float(proxy_info["proxy_post_match_scale"]),
+            "proxy_post_match_enabled": int(proxy_info["proxy_post_match_enabled"]),
             "proxy_target_mean": float(proxy_info["proxy_target_mean"]),
             "proxy_base_target_mean": float(proxy_info["proxy_base_target_mean"]),
             "proxy_calibration_scale": float(proxy_info["proxy_calibration_scale"]),
@@ -352,6 +458,12 @@ def prepare_low_light_batch(image, aug_cfg=None, training=True, proxy_cfg=None):
         "proxy_shadow_mean": float(proxy_info["proxy_shadow_mean"]),
         "proxy_blend_mean": float(proxy_info["proxy_blend_mean"]),
         "proxy_shadow_weight_mean": float(proxy_info["proxy_shadow_weight_mean"]),
+        "proxy_y_mean": float(proxy_info["proxy_y_mean"]),
+        "proxy_global_y_mean": float(proxy_info["proxy_global_y_mean"]),
+        "proxy_shadow_y_mean": float(proxy_info["proxy_shadow_y_mean"]),
+        "proxy_blend_y_mean": float(proxy_info["proxy_blend_y_mean"]),
+        "proxy_post_match_scale": float(proxy_info["proxy_post_match_scale"]),
+        "proxy_post_match_enabled": int(proxy_info["proxy_post_match_enabled"]),
         "proxy_target_mean": float(proxy_info["proxy_target_mean"]),
         "proxy_base_target_mean": float(proxy_info["proxy_base_target_mean"]),
         "proxy_calibration_scale": float(proxy_info["proxy_calibration_scale"]),
