@@ -133,6 +133,8 @@ python tools/extract_marigold_depth.py dataset/Development/lowlight_development/
 python tools/extract_structure_prior.py dataset/Development/lowlight_development/development/Laboratory --device cuda --skip-existing
 python tools/build_fixed_pose_colmap_sparse_init.py dataset/Development/lowlight_development/development/Laboratory --config-path config/stage4_tuned_colmap/laboratory.yaml --colmap-bin colmap --overwrite
 python train.py -c config/stage4_tuned_colmap/laboratory.yaml
+conda activate low-light
+cd autodl-tmp/3DRR_codebase
 python eval.py -w outputs/stage4_tuned_colmap/Laboratory/step_15000/step_15000.pt
 conda activate low-light
 cd autodl-tmp/3DRR_codebase

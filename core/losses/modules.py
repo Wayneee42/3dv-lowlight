@@ -1767,8 +1767,24 @@ class SparsePointRegularizationLoss(BaseLossModule):
         }
 
     def compute(self, context):
+        collect_visual = bool(context.get("_collect_sparse_visual", False))
         if not self.is_active(context):
             zero = zero_scalar_like(context)
+            if collect_visual:
+                context["_sparse_visual_payload"] = {
+                    "active": 0,
+                    "sampling_mode": self.sampling_mode,
+                    "difficulty_score_mode": self.difficulty_score,
+                    "hard_sample_count": 0,
+                    "random_sample_count": 0,
+                    "candidate_count": 0,
+                    "sampled_indices": torch.zeros((0,), dtype=torch.long),
+                    "sampled_means": torch.zeros((0, 3), dtype=torch.float32),
+                    "sampled_opacity": torch.zeros((0,), dtype=torch.float32),
+                    "sampled_difficulty": torch.zeros((0,), dtype=torch.float32),
+                    "sampled_mid_hard_mask": torch.zeros((0,), dtype=torch.bool),
+                    "sampled_mid_hard_score": torch.zeros((0,), dtype=torch.float32),
+                }
             return zero, {
                 "active": 0.0,
                 "sampled": 0.0,
@@ -1830,6 +1846,21 @@ class SparsePointRegularizationLoss(BaseLossModule):
         active_indices = torch.nonzero(active_mask, as_tuple=False).squeeze(-1)
         if active_indices.numel() == 0:
             zero = zero_scalar_like(context)
+            if collect_visual:
+                context["_sparse_visual_payload"] = {
+                    "active": 1,
+                    "sampling_mode": self.sampling_mode,
+                    "difficulty_score_mode": self.difficulty_score,
+                    "hard_sample_count": 0,
+                    "random_sample_count": 0,
+                    "candidate_count": 0,
+                    "sampled_indices": torch.zeros((0,), dtype=torch.long),
+                    "sampled_means": torch.zeros((0, 3), dtype=torch.float32),
+                    "sampled_opacity": torch.zeros((0,), dtype=torch.float32),
+                    "sampled_difficulty": torch.zeros((0,), dtype=torch.float32),
+                    "sampled_mid_hard_mask": torch.zeros((0,), dtype=torch.bool),
+                    "sampled_mid_hard_score": torch.zeros((0,), dtype=torch.float32),
+                }
             return zero, {
                 "active": 1.0,
                 "active_count": 0.0,
@@ -1991,6 +2022,31 @@ class SparsePointRegularizationLoss(BaseLossModule):
                     sampled_mid_hard_payload["mid_hard_score"][sampled_mid_hard_mask],
                     [(0.50, "p50"), (0.90, "p90")],
                 )
+        if collect_visual:
+            sampled_mid_hard_mask = (
+                sampled_mid_hard_payload["mid_hard_mask"].detach().to(device="cpu")
+                if sampled_mid_hard_payload is not None
+                else torch.zeros((sample_count,), dtype=torch.bool)
+            )
+            sampled_mid_hard_score = (
+                sampled_mid_hard_payload["mid_hard_score"].detach().to(device="cpu")
+                if sampled_mid_hard_payload is not None
+                else torch.zeros((sample_count,), dtype=torch.float32)
+            )
+            context["_sparse_visual_payload"] = {
+                "active": 1,
+                "sampling_mode": str(sampling_logs.get("sampling_mode", self.sampling_mode)),
+                "difficulty_score_mode": str(effective_difficulty_mode),
+                "hard_sample_count": int(round(float(sampling_logs.get("hard_sample_count", 0.0)))),
+                "random_sample_count": int(round(float(sampling_logs.get("random_sample_count", 0.0)))),
+                "candidate_count": int(round(float(sampling_logs.get("candidate_count", 0.0)))),
+                "sampled_indices": sampled_indices.detach().to(device="cpu", dtype=torch.long),
+                "sampled_means": sampled_means.detach().to(device="cpu", dtype=torch.float32),
+                "sampled_opacity": sampled_opacity.detach().to(device="cpu", dtype=torch.float32),
+                "sampled_difficulty": difficulty_scores.detach().to(device="cpu", dtype=torch.float32),
+                "sampled_mid_hard_mask": sampled_mid_hard_mask,
+                "sampled_mid_hard_score": sampled_mid_hard_score,
+            }
         if self.robust_scale > 0.0:
             robust_loss = torch.sqrt(target_dist.square() + self.robust_scale * self.robust_scale) - self.robust_scale
         else:

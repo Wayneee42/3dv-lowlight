@@ -144,6 +144,51 @@ def append_json_txt_record(path, payload):
         handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def _safe_to_cpu_tensor(value, dtype=None):
+    if value is None:
+        return None
+    if not torch.is_tensor(value):
+        value = torch.tensor(value)
+    value = value.detach().to(device="cpu")
+    if dtype is not None:
+        value = value.to(dtype=dtype)
+    return value
+
+
+def _to_uint8_chw(image_chw):
+    if image_chw is None:
+        return None
+    return (image_chw.detach().to(device="cpu").clamp(0.0, 1.0) * 255.0).round().to(dtype=torch.uint8)
+
+
+def build_empty_sparse_visual_payload():
+    return {
+        "active": 0,
+        "sampling_mode": "unknown",
+        "difficulty_score_mode": "unknown",
+        "hard_sample_count": 0,
+        "random_sample_count": 0,
+        "candidate_count": 0,
+        "sampled_indices": torch.zeros((0,), dtype=torch.long),
+        "sampled_means": torch.zeros((0, 3), dtype=torch.float32),
+        "sampled_opacity": torch.zeros((0,), dtype=torch.float32),
+        "sampled_difficulty": torch.zeros((0,), dtype=torch.float32),
+        "sampled_mid_hard_mask": torch.zeros((0,), dtype=torch.bool),
+        "sampled_mid_hard_score": torch.zeros((0,), dtype=torch.float32),
+    }
+
+
+def build_empty_topology_visual_payload():
+    return {
+        "topology_event": 0,
+        "coverage_hole_indices": torch.zeros((0,), dtype=torch.long),
+        "spawn_sparse_indices": torch.zeros((0,), dtype=torch.long),
+        "prune_indices": torch.zeros((0,), dtype=torch.long),
+        "spawn_points": torch.zeros((0, 3), dtype=torch.float32),
+        "coverage_hole_points": torch.zeros((0, 3), dtype=torch.float32),
+    }
+
+
 def grad_norm_value(grad_tensor):
     if grad_tensor is None:
         return 0.0
@@ -1245,6 +1290,7 @@ def run_sparse_topology_event(
     total_steps,
     loss_modules,
     runtime_state=None,
+    collect_visual_data=False,
 ):
     event_info = {
         "record_type": "topology_event",
@@ -1281,7 +1327,8 @@ def run_sparse_topology_event(
         "prune_render_filtered_count": 0,
     }
     if sparse_points is None or int(sparse_points.shape[0]) == 0:
-        return optimizers, {}, event_info
+        visual_payload = build_empty_topology_visual_payload() if collect_visual_data else None
+        return optimizers, {}, event_info, visual_payload
 
     device = model.splats["means"].device
     means = model.splats["means"].detach()
@@ -1583,7 +1630,17 @@ def run_sparse_topology_event(
         schedulers = {}
 
     event_info["num_gaussians_after"] = int(model.num_gaussians)
-    return optimizers, schedulers, event_info
+    visual_payload = None
+    if collect_visual_data:
+        visual_payload = {
+            "topology_event": 1,
+            "coverage_hole_indices": coverage_hole_indices.detach().to(device="cpu", dtype=torch.long),
+            "spawn_sparse_indices": spawn_sparse_indices.detach().to(device="cpu", dtype=torch.long),
+            "prune_indices": prune_indices.detach().to(device="cpu", dtype=torch.long),
+            "spawn_points": spawn_points.detach().to(device="cpu", dtype=torch.float32),
+            "coverage_hole_points": sparse_points[coverage_hole_indices].detach().to(device="cpu", dtype=torch.float32),
+        }
+    return optimizers, schedulers, event_info, visual_payload
 
 def train(config_path, device="cuda"):
     meta_cfg = ConfigDict(config_path=config_path)
@@ -1907,14 +1964,26 @@ def train(config_path, device="cuda"):
             "proxy_post_match_global_route_push_safety_thresh": float(_cfg_get(proxy_cfg, "POST_MATCH_GLOBAL_ROUTE_PUSH_SAFETY_THRESH", 0.90)),
         }
         append_json_txt_record(stage6_diag_path, stage6_header_payload)
+    visual_data_enabled = bool(lite_sparse_mode)
+    visual_data_interval = 500
+    visual_data_dir = os.path.join(output_dir, "visual_data")
+    if visual_data_enabled:
+        os.makedirs(visual_data_dir, exist_ok=True)
     pbar = tqdm(range(total_steps))
     for step in pbar:
         current_step = step + 1
+        capture_visual_data = visual_data_enabled and (current_step % visual_data_interval == 0)
 
         if step > 0 and step % cfg.SH_UPGRADE_INTERVAL == 0:
             model.sh_degree = min(model.sh_degree + 1, model.sh_degree_max)
 
-        data = train_dataset[random.randint(0, num_train - 1)]
+        if capture_visual_data:
+            # Change the index '5' below to any index from 0 to 9 to select one of the first 10 training images
+            # This locks the viewpoint for the visual payload (.pt files) across all steps
+            target_view_index = min(5, num_train - 1)  # <-- Modify '5' here to your desired target view (e.g., 0, 1, 2)
+            data = train_dataset[target_view_index]
+        else:
+            data = train_dataset[random.randint(0, num_train - 1)]
         input_image = data["images"].to(device)
         train_batch = prepare_low_light_batch(input_image, augmentation_cfg, training=True, proxy_cfg=proxy_cfg)
         supervision_image = train_batch["supervision"]
@@ -1948,6 +2017,8 @@ def train(config_path, device="cuda"):
 
         context = {
             "step": current_step,
+            "_collect_sparse_visual": bool(capture_visual_data),
+            "_sparse_visual_payload": None,
             "rendered": rendered,
             "rgb_base_hwc": render_outputs["rgb"],
             "rgb_model_hwc": render_outputs["rgb"],
@@ -2024,6 +2095,7 @@ def train(config_path, device="cuda"):
         loss_logs["chroma_available"] = float(render_outputs.get("chroma_aux") is not None)
         sparse_diag_snapshot = None
         stage6_diag_snapshot = None
+        topology_visual_payload = build_empty_topology_visual_payload() if capture_visual_data else None
         topology_event_info = {
             "topology_event": 0,
             "spawn_count": 0,
@@ -2240,7 +2312,7 @@ def train(config_path, device="cuda"):
             scheduler.step()
         if topology_enabled and should_run_sparse_topology(current_step, topology_cfg):
             topology_event_info["num_gaussians_before"] = int(model.num_gaussians)
-            optimizers, topology_schedulers, topology_record = run_sparse_topology_event(
+            optimizers, topology_schedulers, topology_record, topology_visual_payload = run_sparse_topology_event(
                 model=model,
                 sparse_points=colmap_sparse_points,
                 sparse_track_len=colmap_sparse_track_len,
@@ -2257,6 +2329,7 @@ def train(config_path, device="cuda"):
                 total_steps=total_steps,
                 loss_modules=loss_modules,
                 runtime_state=gaussian_runtime_state,
+                collect_visual_data=bool(capture_visual_data),
             )
             if topology_schedulers:
                 schedulers = topology_schedulers
@@ -2305,6 +2378,54 @@ def train(config_path, device="cuda"):
         if stage6_diag_snapshot is not None:
             stage6_diag_records.append(stage6_diag_snapshot)
             append_json_txt_record(stage6_diag_path, stage6_diag_snapshot)
+        if capture_visual_data:
+            sparse_visual_payload = context.get("_sparse_visual_payload")
+            if sparse_visual_payload is None:
+                sparse_visual_payload = build_empty_sparse_visual_payload()
+            if topology_visual_payload is None:
+                topology_visual_payload = build_empty_topology_visual_payload()
+            visual_payload = {
+                "record_type": "visual_snapshot",
+                "step": int(current_step),
+                "scene": str(meta_cfg.DATASET.NAME),
+                "frame_key": str(data["infos"]["frame_key"]),
+                "num_gaussians": int(model.num_gaussians),
+                "image_height": int(H),
+                "image_width": int(W),
+                "camera": {
+                    "camtoworld": _safe_to_cpu_tensor(camtoworld, dtype=torch.float32),
+                    "intrinsics": _safe_to_cpu_tensor(intrinsics, dtype=torch.float32),
+                },
+                "images": {
+                    "input_reference_u8": _to_uint8_chw(reference_image),
+                    "input_supervision_u8": _to_uint8_chw(supervision_image),
+                    "current_render_u8": _to_uint8_chw(rendered.permute(2, 0, 1)),
+                },
+                "sparse_prior": {
+                    "points": _safe_to_cpu_tensor(colmap_sparse_points, dtype=torch.float32),
+                    "track_len": _safe_to_cpu_tensor(colmap_sparse_track_len, dtype=torch.float32),
+                    "reproj_error": _safe_to_cpu_tensor(colmap_sparse_reproj_error, dtype=torch.float32),
+                    "brightness_score": _safe_to_cpu_tensor(colmap_sparse_brightness_score, dtype=torch.float32),
+                    "gradient_score": _safe_to_cpu_tensor(colmap_sparse_gradient_score, dtype=torch.float32),
+                    "filter_mode": str(sparse_load_info.get("filter_mode", "disabled")),
+                    "filter_kept_ratio": float(sparse_load_info.get("filter_kept_ratio", 1.0)),
+                },
+                "sparse_sampling": sparse_visual_payload,
+                "topology": topology_visual_payload,
+                "topology_metrics": {
+                    "topology_event": int(topology_event_info.get("topology_event", 0)),
+                    "spawn_count": int(topology_event_info.get("spawn_count", 0)),
+                    "prune_count": int(topology_event_info.get("prune_count", 0)),
+                    "coverage_hole_count": int(topology_event_info.get("coverage_hole_count", 0)),
+                    "coverage_hole_ratio": float(topology_event_info.get("coverage_hole_ratio", 0.0)),
+                    "spawn_distance_mean": float(topology_event_info.get("spawn_distance_mean", 0.0)),
+                    "prune_distance_mean": float(topology_event_info.get("prune_distance_mean", 0.0)),
+                    "num_gaussians_before": int(topology_event_info.get("num_gaussians_before", model.num_gaussians)),
+                    "num_gaussians_after": int(topology_event_info.get("num_gaussians_after", model.num_gaussians)),
+                },
+            }
+            visual_path = os.path.join(visual_data_dir, f"step_{int(current_step):06d}.pt")
+            torch.save(visual_payload, visual_path)
         if step % cfg.LOG_INTERVAL_STEP == 0:
             with torch.no_grad():
                 base_target = context["supervision_hwc"]

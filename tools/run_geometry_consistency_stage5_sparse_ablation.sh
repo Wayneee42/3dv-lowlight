@@ -47,7 +47,7 @@ if [[ -n "${VARIANTS:-}" ]]; then
 else
   VARIANT_LIST=(
     stage5b_ft_off
-    stage5b_ft_on
+    stage5c_vsurface_lite
   )
 fi
 
@@ -115,7 +115,10 @@ for path in json_paths:
             "split": data.get("split", ""),
             "sample_stride": data.get("sample_stride", ""),
             "reproj_depth_error": data.get("reproj_depth_error", ""),
+            "reproj_normal_error": data.get("reproj_normal_error", ""),
+            "reproj_normal_error_median": data.get("reproj_normal_error_median", ""),
             "consistency_ratio": data.get("consistency_ratio", ""),
+            "normal_consistency_ratio@15": data.get("normal_consistency_ratio@15", ""),
             "overlap_ratio": data.get("overlap_ratio", ""),
             "overlap_ratio_total": data.get("overlap_ratio_total", ""),
             "source_valid_ratio": data.get("source_valid_ratio", ""),
@@ -137,7 +140,10 @@ with open(tsv_path, "w", encoding="utf-8", newline="") as handle:
             "split",
             "sample_stride",
             "reproj_depth_error",
+            "reproj_normal_error",
+            "reproj_normal_error_median",
             "consistency_ratio",
+            "normal_consistency_ratio@15",
             "overlap_ratio",
             "overlap_ratio_total",
             "source_valid_ratio",
